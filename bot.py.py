@@ -534,7 +534,7 @@ async def _download(session, post: dict, limit: int, sem: asyncio.Semaphore):
     async with sem:
         for url in urls:
             try:
-  async with session.get(
+                async with session.get(
                     url,
                     headers=(
                         {"Referer": "https://gelbooru.com/"}
@@ -557,6 +557,8 @@ async def _download(session, post: dict, limit: int, sem: asyncio.Semaphore):
                     blob = await r.read()
 
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                reason = type(exc).__name__
+                continue
                 reason = type(exc).__name__
                 continue
 
