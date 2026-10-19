@@ -696,52 +696,86 @@ async def run_search(session, spec: Spec) -> Outcome:
     return Outcome(query, display, ok + bad, time.monotonic() - started)
 
 
-def _render(spec: Spec, outcome: Outcome) -> tuple[list[discord.Embed], list[discord.File]]:
+
+  def _render(spec: Spec, outcome: Outcome) -> tuple[list[discord.Embed], list[discord.File]]:
     files: list[discord.File] = []
-    names: list[str] = []
+    images: list[str] = []
     lines: list[str] = []
     failed: list[dict] = []
 
     for post, blob, name, reason in outcome.results:
         link = f"[{post['site']} #{post['id']}]({post['page']})"
-        if blob is not None:
-            files.append(discord.File(io.BytesIO(blob), filename=name, spoiler=spec.spoiler))
-            names.append(name)
+
+        if blob is not None and name:
+            upload = discord.File(
+                io.BytesIO(blob),
+                filename=name,
+                spoiler=spec.spoiler
+            )
+            files.append(upload)
             lines.append(f"`{len(files):02d}` {link}")
+
+            ext = _ext_from_url(name)
+
+            if ext in IMAGE_EXTS:
+                images.append(upload.filename)
+
         else:
             lines.append(f"~~{link}~~ · *{reason}*")
             failed.append(post)
 
-    title = "Genshin cosplay (IRL)" if spec.kind == "cosplay" else "Genshin Impact"
-    if outcome.character:
-        title = f"{title} · {outcome.character}"
-
-    summary = discord.Embed(title=title, description="\n".join(lines) or "No results.", color=0x7B68EE)
-    summary.set_footer(
-        text=f"{outcome.query} · {len(files)} file(s) · {outcome.elapsed:.1f}s"
-             f"{FOOTER_SEP}{_encode_spec(spec)}"
+    title = (
+        "Genshin cosplay (IRL)"
+        if spec.kind == "cosplay"
+        else "Genshin Impact"
     )
 
-    # One embed per file, so every upload renders as media. Attachments that an
-    # embed references via `attachment://` are shown inline instead of as a bare
-    # file card. Videos are left unreferenced so they keep Discord's player.
-    embeds = [summary] + [discord.Embed(color=0x7B68EE) for _ in names[1:]]
-   
+    if outcome.character:
+        title += f" · {outcome.character}"
+
+    summary = discord.Embed(
+        title=title,
+        description="\n".join(lines) or "No results.",
+        color=0x7B68EE
+    )
+
+    summary.set_footer(
+        text=(
+            f"{outcome.query} · {len(files)} file(s) · "
+            f"{outcome.elapsed:.1f}s"
+            f"{FOOTER_SEP}{_encode_spec(spec)}"
+        )
+    )
+
     embeds = [summary]
 
-    for name in names:
-        if _ext_from_url(name) not in VIDEO_EXTS:
+    if not spec.spoiler:
+        # Put the first image directly in the main embed.
+        if images:
+            summary.set_image(
+                url=f"attachment://{images[0]}"
+            )
+
+        # Discord allows a maximum of 10 embeds per message.
+        for name in images[1:10]:
             image_embed = discord.Embed(color=0x7B68EE)
-            image_embed.set_image(url=f"attachment://{name}")
+            image_embed.set_image(
+                url=f"attachment://{name}"
+            )
             embeds.append(image_embed)
 
+    # Video files remain normal attachments so Discord
+    # can display a video player when the format is supported.
 
-    if not files:
+    if not files and not spec.spoiler:
         for post in failed[:4]:
-            embeds.append(discord.Embed(color=0x7B68EE).set_image(url=post["thumb"]))
+            thumbnail = post.get("thumb")
+            if thumbnail:
+                embed = discord.Embed(color=0x7B68EE)
+                embed.set_image(url=thumbnail)
+                embeds.append(embed)
 
     return embeds, files
-
 
 # -------------------------------------------------------------- result view
 
@@ -1075,7 +1109,6 @@ async def _genshinporn(
         )
         return
     embeds, files = _render(spec, outcome)
-    m
     message = await interaction.edit_original_response(
         embeds=embeds,
         attachments=files,
@@ -1212,14 +1245,6 @@ tree.add_command(app_commands.Command(
 # ------------------------------------------------------------------- runtime
 
 VIEW = ResultView()
-
-
-@bot.event
-async def on_ready() -> None:
-    log.info("logged in as %s (%d guilds)", bot.user, len(bot.guilds))
-
-
-@bot.event
 
 @bot.event
 async def on_ready() -> None:
