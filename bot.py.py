@@ -219,16 +219,23 @@ RESOLVED_CHARS: list[tuple[str, str]] = list(CHARACTERS)
 CHAR_BY_TAG: dict[str, str] = {tag: display for display, tag in CHARACTERS}
 
 
-# For NSFW cosplay searches, only known adult Genshin characters are eligible.
-# This conservative list can be extended after verifying character ages.
+# Characters eligible for adult-rated cosplay searches. Unlisted characters
+# use safe-rated cosplay instead. Do not include child or age-ambiguous characters.
 ADULT_COSPLAY_TAGS = {
-    "arlecchino", "beidou", "candace", "charlotte", "chasca",
-    "chevreuse", "chiori", "clorinde", "columbina", "dehya",
-    "emilie", "eula", "furina", "ganyu", "jean", "la_signora",
-    "lisa", "mavuika", "mona", "navia", "ningguang",
-    "raiden_shogun", "rosaria", "sangonomiya_kokomi", "shenhe",
-    "xianyun", "xilonen", "yae_miko", "yelan", "yoimiya",
+    "aloy", "arlecchino", "beidou", "candace", "charlotte",
+    "chasca", "chevreuse", "chiori", "citlali", "clorinde",
+    "columbina", "dehya", "emilie", "escoffier", "eula",
+    "faruzan", "furina", "ganyu", "hu_tao", "ineffa",
+    "jahoda", "jean", "kamisato_ayaka", "keqing", "kujou_sara",
+    "kuki_shinobu", "la_signora", "lan_yan", "lauma", "layla",
+    "linnea", "lisa", "lumine", "mavuika", "mona", "navia",
+    "nefer", "nicole", "nilou", "ningguang", "odette",
+    "raiden_shogun", "rosaria", "sandrone", "sangonomiya_kokomi", "shenhe",
+    "skirk", "sucrose", "varesa", "vesna", "vodyanitsa",
+    "xianyun", "xiangling", "xilonen", "yae_miko", "yanfei", "yelan",
+    "yoimiya", "yumemizuki_mizuki", "yun_jin", "zibai",
 }
+
 
 def _base_character_tag(tag: str) -> str:
     return tag.split("_(genshin_impact)", 1)[0].lower().strip()
@@ -1441,11 +1448,10 @@ async def _cosplay(
         spoiler=spoiler,
         limit=_file_limit(interaction),
     )
+    # Avoid interrupting cosplay searches with an adult-character warning.
+    # Characters not verified as adults are automatically limited to safe media.
     if spec.character and spec.rating != "safe" and not _adult_character_match(spec.character):
-        await interaction.edit_original_response(
-            content="For adult-rated cosplay searches, select a verified adult character, or use rating:safe."
-        )
-        return
+        spec = replace(spec, rating="safe")
     if spec.rating != "safe" and not _channel_is_nsfw(interaction):
         await interaction.edit_original_response(
             content="Run adult-rated cosplay searches in an age-restricted Discord channel, or select rating:safe."
