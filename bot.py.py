@@ -534,8 +534,13 @@ async def _download(session, post: dict, limit: int, sem: asyncio.Semaphore):
     async with sem:
         for url in urls:
             try:
-                async with session.get(
+  async with session.get(
                     url,
+                    headers=(
+                        {"Referer": "https://gelbooru.com/"}
+                        if post["site"] == "Gelbooru"
+                        else None
+                    ),
                     timeout=aiohttp.ClientTimeout(total=90)
                 ) as r:
                     if r.status != 200:
