@@ -552,7 +552,22 @@ async def _download(session, post: dict, limit: int, sem: asyncio.Semaphore):
                 reason = f"{len(blob) // 1024} KB"
                 continue
 
-            name = f"{post['site'].lower()}_{post['id']}.{_pick_ext(post, ctype)}"
+                        if post["is_video"]:
+                if len(blob) >= 12 and blob[4:8] == b"ftyp":
+                    extension = "mp4"
+                elif blob.startswith(b"\x1a\x45\xdf\xa3"):
+                    extension = "webm"
+                else:
+                    log.warning(
+                        "Invalid video: %s, type=%s, size=%d",
+                        url, ctype, len(blob)
+                    )
+                    reason = "invalid video data"
+                    continue
+            else:
+                extension = _pick_ext(post, ctype)
+
+            name = f"{post['site'].lower()}_{post['id']}.{extension}"
             return post, blob, name, None
 
     return post, None, None, reason
