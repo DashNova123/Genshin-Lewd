@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import collections
 import io
+import html
+import re
 import json
 import logging
 import os
@@ -31,6 +33,10 @@ TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 GUILD_ID = os.getenv("GUILD_ID", "").strip()
 GELBOORU_API_KEY = os.getenv("GELBOORU_API_KEY", "").strip()
 GELBOORU_USER_ID = os.getenv("GELBOORU_USER_ID", "").strip()
+# Optional: only use Reddit after receiving Reddit Data API approval.
+REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID", "").strip()
+REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET", "").strip()
+REDDIT_USER_AGENT = os.getenv("REDDIT_USER_AGENT", "GenshinCosplayDiscordBot/1.0").strip()
 
 UA = "GenshinBooruBot/3.0"
 VIDEO_EXTS = {"mp4", "webm"}
@@ -212,6 +218,60 @@ CHARACTERS: list[tuple[str, str]] = [
 RESOLVED_CHARS: list[tuple[str, str]] = list(CHARACTERS)
 CHAR_BY_TAG: dict[str, str] = {tag: display for display, tag in CHARACTERS}
 
+
+# For NSFW cosplay searches, only known adult Genshin characters are eligible.
+# This conservative list can be extended after verifying character ages.
+ADULT_COSPLAY_TAGS = {
+    "arlecchino", "beidou", "candace", "charlotte", "chasca",
+    "chevreuse", "chiori", "clorinde", "columbina", "dehya",
+    "emilie", "eula", "furina", "ganyu", "jean", "la_signora",
+    "lisa", "mavuika", "mona", "navia", "ningguang",
+    "raiden_shogun", "rosaria", "sangonomiya_kokomi", "shenhe",
+    "xianyun", "xilonen", "yae_miko", "yelan", "yoimiya",
+}
+
+def _base_character_tag(tag: str) -> str:
+    return tag.split("_(genshin_impact)", 1)[0].lower().strip()
+
+
+def _adult_character_match(tag: str) -> bool:
+    return _base_character_tag(tag) in ADULT_COSPLAY_TAGS
+
+
+def _cosplay_tags_match(post: dict, spec: "Spec") -> bool:
+    # Danbooru's structured tags are checked locally, not just the displayed title.
+    if post.get("site") != "Danbooru":
+        return False
+    tags = set(post.get("tags", []))
+    if "genshin_impact" not in tags or "cosplay_photo" not in tags:
+        return False
+
+    characters = {_base_character_tag(tag) for tag in post.get("character_tags", [])}
+    genshin_characters = {x for x in characters if x in {_base_character_tag(t) for _, t in CHARACTERS}}
+    # No mixed adult/underage cast in adult-oriented cosplay posts.
+    if spec.rating != "safe":
+        if not genshin_characters or not genshin_characters.issubset(ADULT_COSPLAY_TAGS):
+            return False
+    if spec.character and _base_character_tag(spec.character) not in characters:
+        return False
+
+    rating = post.get("rating", "").lower()
+    # Danbooru uses g=general, s=sensitive, q=questionable, e=explicit.
+    if spec.rating == "safe" and rating not in ("g", "s"):
+        return False
+    if spec.rating == "questionable" and rating != "q":
+        return False
+    if spec.rating == "explicit" and rating != "e":
+        return False
+
+    for tag in spec.extra_tags.replace(",", " ").split():
+        if tag.startswith("-"):
+            if tag[1:] in tags:
+                return False
+        elif tag not in tags:
+            return False
+    return _matches(post, spec.mode)
+
 POPULAR_TAGS = [
     "solo", "1girl", "swimsuit", "bikini", "lingerie", "nude", "topless",
     "large_breasts", "small_breasts", "cleavage", "underboob", "sideboob",
@@ -280,11 +340,15 @@ def _p_danbooru(data) -> list[dict]:
         if not full:
             continue
         pid = p.get("id")
-        out.append(_mk_post(
+        item = _mk_post(
             "Danbooru", pid, full, p.get("large_file_url"), p.get("large_file_url"),
             p.get("preview_file_url"), p.get("file_ext"), p.get("file_size"),
             f"https://danbooru.donmai.us/posts/{pid}",
-        ))
+        )
+        item["tags"] = (p.get("tag_string") or "").split()
+        item["character_tags"] = (p.get("tag_string_character") or "").split()
+        item["rating"] = str(p.get("rating") or "").lower()
+        out.append(item)
     return out
 
 
@@ -343,7 +407,7 @@ SOURCES: list[Source] = [
         max_page=1000,
         min_interval=0.2,
         cosplay=True,
-        cosplay_tags=("cosplay", "photo_(medium)"),
+        cosplay_tags=("cosplay_photo",),
         params=lambda t, pg: {"tags": t, "limit": DANBOORU_PAGE_SIZE, "page": pg},
         parse=_p_danbooru,
     ),
@@ -385,6 +449,170 @@ SOURCES: list[Source] = [
         parse=_p_konachan,
     ),
 ]
+
+
+# --- Approved Reddit Data API: optional Genshin-only cosplay source ---------
+
+async def _reddit_cosplay_posts(session: aiohttp.ClientSession, spec: "Spec", count: int) -> list[dict]:
+    """Use Reddit ONLY with approved OAuth credentials; do not scrape Reddit pages."""
+    if not (REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET):
+        return []
+    try:
+        auth = aiohttp.BasicAuth(REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET)
+        async with session.post(
+            "https://www.reddit.com/api/v1/access_token",
+            auth=auth,
+            data={"grant_type": "client_credentials"},
+            headers={"User-Agent": REDDIT_USER_AGENT},
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as response:
+            if response.status != 200:
+                log.warning("Reddit OAuth failed: HTTP %s", response.status)
+                return []
+            token = (await response.json()).get("access_token")
+        if not token:
+            return []
+
+        headers = {"User-Agent": REDDIT_USER_AGENT, "Authorization": f"bearer {token}"}
+        # Genshin-specific subreddit plus a larger adult cosplay community.
+        searches = [
+            ("GenshinImpactCosplays", "new", None),
+            ("nsfwcosplay", "search", "genshin"),
+        ]
+        choices: list[dict] = []
+        for subreddit, operation, query in searches:
+            if operation == "new":
+                url = f"https://oauth.reddit.com/r/{subreddit}/new"
+                params = {"limit": 100, "raw_json": 1}
+            else:
+                url = f"https://oauth.reddit.com/r/{subreddit}/search"
+                params = {"q": query, "restrict_sr": 1, "sort": "new", "limit": 100, "raw_json": 1}
+            async with session.get(
+                url, headers=headers, params=params,
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as response:
+                if response.status != 200:
+                    log.info("Reddit r/%s: HTTP %s", subreddit, response.status)
+                    continue
+                data = await response.json()
+
+            children = data.get("data", {}).get("children", [])
+            for entry in children:
+                p = entry.get("data", {})
+                if p.get("removed_by_category") or p.get("is_self"):
+                    continue
+                title = html.unescape(str(p.get("title", "")))
+                flair = html.unescape(str(p.get("link_flair_text") or ""))
+                text = title + " " + flair
+                ntext = _norm(text)
+                subreddit_is_genshin = subreddit.lower() == "genshinimpactcosplays"
+                has_genshin = "genshin" in ntext
+                matches = [name for name, tag in CHARACTERS
+                           if _adult_character_match(tag)
+                           and (_norm(name) in ntext or _norm(_base_character_tag(tag)) in ntext)]
+                # Never claim a cosplay post is Genshin solely because it says "cosplay".
+                if not ((subreddit_is_genshin and matches) or (has_genshin and matches)):
+                    continue
+                if spec.character and not any(
+                    _norm(_base_character_tag(spec.character)) == _norm(_base_character_tag(tag))
+                    for name, tag in CHARACTERS if name in matches
+                ):
+                    continue
+                if spec.rating == "safe" and p.get("over_18"):
+                    continue
+                if spec.rating in ("explicit", "questionable") and not p.get("over_18"):
+                    continue
+                if spec.extra_tags and not all(
+                    _norm(t) in ntext for t in spec.extra_tags.replace(",", " ").split()
+                ):
+                    continue
+
+                vinfo = ((p.get("secure_media") or p.get("media") or {})
+                         .get("reddit_video") or {})
+                video_url = html.unescape(vinfo.get("fallback_url") or "")
+                if video_url:
+                    url = video_url
+                    ext = "mp4"
+                else:
+                    url = html.unescape(str(p.get("url_overridden_by_dest") or p.get("url") or ""))
+                    ext = _ext_from_url(url)
+                    if ext not in IMAGE_EXTS:
+                        continue
+                is_video = ext in VIDEO_EXTS
+                if spec.mode == "video" and not is_video:
+                    continue
+                if spec.mode == "image" and is_video:
+                    continue
+                pid = str(p.get("id") or "")
+                if not pid or not url.startswith("https://"):
+                    continue
+                post = _mk_post(
+                    "Reddit", pid, url, url, url, url, ext, 0,
+                    "https://www.reddit.com" + str(p.get("permalink") or ""),
+                )
+                choices.append(post)
+        random.shuffle(choices)
+        return choices[:count]
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
+        log.warning("Reddit cosplay API unavailable: %s", type(exc).__name__)
+        return []
+
+
+async def _gather_cosplay(session: aiohttp.ClientSession, spec: "Spec") -> list[dict]:
+    """Only verified Genshin cosplay media, never substitute drawn artwork."""
+    source = next(s for s in SOURCES if s.name == "Danbooru")
+    tags = "genshin_impact cosplay_photo"
+    count = await _danbooru_count(session, tags)
+    page_count = (
+        max(1, min(source.max_page, (count + DANBOORU_PAGE_SIZE - 1) // DANBOORU_PAGE_SIZE))
+        if count else 1
+    )
+
+    # Recent pages plus random deeper pages for variety; limit API requests.
+    pages = list(range(1, min(page_count, 3) + 1))
+    if page_count > 3:
+        max_extra = 13 if spec.mode == "video" else 5
+        pages += random.sample(range(4, page_count + 1), min(max_extra, page_count - 3))
+    random.shuffle(pages)
+
+    reddit_task = None
+    if REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET:
+        reddit_task = asyncio.create_task(
+            _reddit_cosplay_posts(session, spec, spec.count + 4)
+        )
+
+    picked: list[dict] = []
+    seen = set()
+    wanted = min(spec.count + 4, MAX_FILES)
+    for start in range(0, len(pages), 4):
+        batch = pages[start:start + 4]
+        responses = await asyncio.gather(
+            *(_fetch_page(session, source, tags, page) for page in batch)
+        )
+        eligible = [p for results in responses if results
+                    for p in results if _cosplay_tags_match(p, spec)]
+        random.shuffle(eligible)
+        for post in eligible:
+            key = (post["site"], post["id"])
+            if key in seen or (key in RECENT and len(picked) >= spec.count):
+                continue
+            seen.add(key)
+            picked.append(post)
+            if len(picked) >= wanted:
+                break
+        if len(picked) >= wanted:
+            break
+
+    if reddit_task is not None:
+        for post in await reddit_task:
+            key = (post["site"], post["id"])
+            if key not in seen:
+                seen.add(key)
+                picked.append(post)
+
+    random.shuffle(picked)
+    RECENT.extend(seen)
+    return picked[:min(spec.count + 6, MAX_FILES + 4)]
 
 
 # ------------------------------------------------------------- fetch layer
@@ -559,8 +787,6 @@ async def _download(session, post: dict, limit: int, sem: asyncio.Semaphore):
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 reason = type(exc).__name__
                 continue
-                reason = type(exc).__name__
-                continue
 
             if not blob:
                 reason = "empty"
@@ -674,7 +900,7 @@ def _query_for(spec: Spec, character_tag: str) -> Callable[[Source], str]:
 def _display_query(spec: Spec, character_tag: str) -> str:
     parts = ["genshin_impact"]
     if spec.kind == "cosplay":
-        parts.append("cosplay")
+        parts.append("cosplay_photo")
     if character_tag:
         parts.append(character_tag)
     if spec.rating and spec.rating != "any":
@@ -689,6 +915,8 @@ def _pick_sources(spec: Spec) -> list[Source]:
     for src in SOURCES:
         if src.auth and not (GELBOORU_API_KEY and GELBOORU_USER_ID):
             continue
+        if spec.kind == "cosplay" and src.name != "Danbooru":
+            continue
         if spec.kind == "cosplay" and not src.cosplay:
             continue
         if spec.sites and src.name not in spec.sites:
@@ -701,13 +929,24 @@ async def run_search(session, spec: Spec) -> Outcome:
     started = time.monotonic()
     sources = _pick_sources(spec)
 
-    character_tag = spec.character or (random.choice(RESOLVED_CHARS)[1] if RESOLVED_CHARS else "")
-    display = CHAR_BY_TAG.get(character_tag, character_tag)
+    character_tag = spec.character
+    if character_tag and spec.rating != "safe" and not _adult_character_match(character_tag):
+        return Outcome("Adult-rated searches require adult characters.", None, [], time.monotonic() - started)
+    if not character_tag and spec.kind != "cosplay":
+        eligible = (
+            [item for item in RESOLVED_CHARS if _adult_character_match(item[1])]
+            if spec.rating != "safe" else RESOLVED_CHARS
+        )
+        character_tag = random.choice(eligible)[1] if eligible else ""
+    display = CHAR_BY_TAG.get(character_tag, character_tag) if character_tag else None
 
-    posts = await _gather(session, _query_for(spec, character_tag), spec.mode, sources, spec.count) \
-        if sources else []
+    if spec.kind == "cosplay":
+        posts = await _gather_cosplay(session, spec)
+    else:
+        posts = await _gather(session, _query_for(spec, character_tag), spec.mode, sources, spec.count) \
+            if sources else []
 
-    if not posts and character_tag:
+    if not posts and character_tag and spec.kind != "cosplay":
         log.info("no results for %r, retrying without the character tag",
                  _display_query(spec, character_tag))
         display = None
@@ -798,7 +1037,7 @@ def _render(spec: Spec, outcome: Outcome) -> tuple[list[discord.Embed], list[dis
     # Video files remain normal attachments so Discord
     # can display a video player when the format is supported.
 
-    if not files and not spec.spoiler:
+    if not files and not spec.spoiler and spec.kind != "cosplay":
         for post in failed[:4]:
             thumbnail = post.get("thumb")
             if thumbnail:
@@ -1012,6 +1251,12 @@ async def _preset_autocomplete(interaction: discord.Interaction, current: str):
     ][:25]
 
 
+def _channel_is_nsfw(interaction: discord.Interaction) -> bool:
+    channel = interaction.channel
+    checker = getattr(channel, "is_nsfw", None)
+    return bool(callable(checker) and checker())
+
+
 def _file_limit(interaction: discord.Interaction) -> int:
     base = getattr(interaction.guild, "filesize_limit", DEFAULT_LIMIT) if interaction.guild else DEFAULT_LIMIT
     return max(512 * 1024, base - HEADROOM)
@@ -1087,9 +1332,14 @@ async def _genshin(
         "explicit",
     )
 
+    if spec.rating != "safe" and not _channel_is_nsfw(interaction):
+        await interaction.edit_original_response(
+            content="Use an age-restricted channel for adult-rated searches, or select rating:safe."
+        )
+        return
+
     outcome = await run_search(interaction.client.session, spec)
 
-    
     embeds, files = _render(spec, outcome)
     message = await interaction.edit_original_response(
         embeds=embeds,
@@ -1133,6 +1383,11 @@ async def _genshinporn(
     await interaction.response.defer(thinking=True)
     spec = _apply_preset(preset, count, type, "explicit", "", "", spoiler,
                          interaction.user.id, _file_limit(interaction), "explicit")
+    if not _channel_is_nsfw(interaction):
+        await interaction.edit_original_response(
+            content="Run adult-rated commands in an age-restricted Discord channel."
+        )
+        return
     outcome = await run_search(interaction.client.session, spec)
     if not outcome.results:
         await interaction.edit_original_response(
@@ -1186,14 +1441,24 @@ async def _cosplay(
         spoiler=spoiler,
         limit=_file_limit(interaction),
     )
+    if spec.character and spec.rating != "safe" and not _adult_character_match(spec.character):
+        await interaction.edit_original_response(
+            content="For adult-rated cosplay searches, select a verified adult character, or use rating:safe."
+        )
+        return
+    if spec.rating != "safe" and not _channel_is_nsfw(interaction):
+        await interaction.edit_original_response(
+            content="Run adult-rated cosplay searches in an age-restricted Discord channel, or select rating:safe."
+        )
+        return
+
     outcome = await run_search(interaction.client.session, spec)
     if not outcome.results:
         await interaction.edit_original_response(
-            content=f"No results for `{outcome.query}`. Try dropping the character or the tags."
+            content=f"No verified Genshin cosplay found for `{outcome.query}`. Try image only, fewer tags, or rating:any."
         )
         return
     embeds, files = _render(spec, outcome)
-    m
     message = await interaction.edit_original_response(
         embeds=embeds,
         attachments=files,
