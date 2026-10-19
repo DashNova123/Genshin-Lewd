@@ -695,8 +695,7 @@ async def run_search(session, spec: Spec) -> Outcome:
 
     return Outcome(query, display, ok + bad, time.monotonic() - started)
 
-
- def _render(spec: Spec, outcome: Outcome) -> tuple[list[discord.Embed], list[discord.File]]:
+def _render(spec: Spec, outcome: Outcome) -> tuple[list[discord.Embed], list[discord.File]]:
     files: list[discord.File] = []
     images: list[str] = []
     lines: list[str] = []
