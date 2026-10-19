@@ -518,29 +518,39 @@ async def _gather(session, build: Callable[[Source], str], mode: str,
 
     RECENT.extend(seen)
     return picked
-
-
 async def _download(session, post: dict, limit: int, sem: asyncio.Semaphore):
-    urls = [post["full"] if post["is_video"] else (post["preview"] or post["full"])]
+    urls = [
+        post["full"] if post["is_video"]
+        else (post["preview"] or post["full"])
+    ]
+
     if post["is_video"]:
         for alt in (post["sample"], post["preview"]):
             if alt and alt not in urls:
                 urls.append(alt)
 
     reason = "unreachable"
+
     async with sem:
         for url in urls:
             try:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=90)) as r:
+                async with session.get(
+                    url,
+                    timeout=aiohttp.ClientTimeout(total=90)
+                ) as r:
                     if r.status != 200:
                         reason = f"HTTP {r.status}"
                         continue
+
                     ctype = r.headers.get("Content-Type", "").lower()
                     clen = r.content_length
+
                     if clen and clen > limit:
                         reason = f"{clen // 1024} KB"
                         continue
+
                     blob = await r.read()
+
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 reason = type(exc).__name__
                 continue
@@ -548,11 +558,12 @@ async def _download(session, post: dict, limit: int, sem: asyncio.Semaphore):
             if not blob:
                 reason = "empty"
                 continue
+
             if len(blob) > limit:
                 reason = f"{len(blob) // 1024} KB"
                 continue
 
-                        if post["is_video"]:
+            if post["is_video"]:
                 if len(blob) >= 12 and blob[4:8] == b"ftyp":
                     extension = "mp4"
                 elif blob.startswith(b"\x1a\x45\xdf\xa3"):
