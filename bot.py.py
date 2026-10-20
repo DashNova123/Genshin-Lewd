@@ -191,10 +191,10 @@ CHARACTERS: list[tuple[str, str]] = [
     ("Charlotte", "charlotte"), ("Chasca", "chasca"), ("Chevreuse", "chevreuse"),
     ("Chiori", "chiori"), ("Citlali", "citlali"), ("Clorinde", "clorinde"),
     ("Collei", "collei"), ("Columbina", "columbina"), ("Dehya", "dehya"),
-    ("Diona", "diona"), ("Emilie", "emilie"), ("Escoffier", "escoffier"),
+    ("Emilie", "emilie"), ("Escoffier", "escoffier"),
     ("Eula", "eula"), ("Faruzan", "faruzan"), ("Fischl", "fischl"),
     ("Furina", "furina"), ("Ganyu", "ganyu"), ("Hu Tao", "hu_tao"),
-    ("Iansan", "iansan"), ("Ineffa", "ineffa"), ("Jahoda", "jahoda"),
+    ("Ineffa", "ineffa"), ("Jahoda", "jahoda"),
     ("Jean", "jean"), ("Kachina", "kachina"), ("Kamisato Ayaka", "kamisato_ayaka"),
     ("Keqing", "keqing"), ("Kirara", "kirara"), ("Klee", "klee"),
     ("Kujou Sara", "kujou_sara"), ("Kuki Shinobu", "kuki_shinobu"), ("La Signora", "la_signora"),
@@ -219,30 +219,8 @@ RESOLVED_CHARS: list[tuple[str, str]] = list(CHARACTERS)
 CHAR_BY_TAG: dict[str, str] = {tag: display for display, tag in CHARACTERS}
 
 
-# Characters eligible for adult-rated cosplay searches. Unlisted characters
-# use safe-rated cosplay instead. Do not include child or age-ambiguous characters.
-ADULT_COSPLAY_TAGS = {
-    "aloy", "arlecchino", "beidou", "candace", "charlotte",
-    "chasca", "chevreuse", "chiori", "citlali", "clorinde",
-    "columbina", "dehya", "emilie", "escoffier", "eula",
-    "faruzan", "furina", "ganyu", "hu_tao", "ineffa",
-    "jahoda", "jean", "kamisato_ayaka", "keqing", "kujou_sara",
-    "kuki_shinobu", "la_signora", "lan_yan", "lauma", "layla",
-    "linnea", "lisa", "lumine", "mavuika", "mona", "navia",
-    "nefer", "nicole", "nilou", "ningguang", "odette",
-    "raiden_shogun", "rosaria", "sandrone", "sangonomiya_kokomi", "shenhe",
-    "skirk", "sucrose", "varesa", "vesna", "vodyanitsa",
-    "xianyun", "xiangling", "xilonen", "yae_miko", "yanfei", "yelan",
-    "yoimiya", "yumemizuki_mizuki", "yun_jin", "zibai",
-}
-
-
 def _base_character_tag(tag: str) -> str:
     return tag.split("_(genshin_impact)", 1)[0].lower().strip()
-
-
-def _adult_character_match(tag: str) -> bool:
-    return _base_character_tag(tag) in ADULT_COSPLAY_TAGS
 
 
 def _cosplay_tags_match(post: dict, spec: "Spec") -> bool:
@@ -253,14 +231,10 @@ def _cosplay_tags_match(post: dict, spec: "Spec") -> bool:
     if "genshin_impact" not in tags or "cosplay_photo" not in tags:
         return False
 
-    characters = {_base_character_tag(tag) for tag in post.get("character_tags", [])}
-    genshin_characters = {x for x in characters if x in {_base_character_tag(t) for _, t in CHARACTERS}}
-    # No mixed adult/underage cast in adult-oriented cosplay posts.
-    if spec.rating != "safe":
-        if not genshin_characters or not genshin_characters.issubset(ADULT_COSPLAY_TAGS):
+    if spec.character:
+        characters = {_base_character_tag(tag) for tag in post.get("character_tags", [])}
+        if _base_character_tag(spec.character) not in characters:
             return False
-    if spec.character and _base_character_tag(spec.character) not in characters:
-        return False
 
     rating = post.get("rating", "").lower()
     # Danbooru uses g=general, s=sensitive, q=questionable, e=explicit.
@@ -515,8 +489,7 @@ async def _reddit_cosplay_posts(session: aiohttp.ClientSession, spec: "Spec", co
                 subreddit_is_genshin = subreddit.lower() == "genshinimpactcosplays"
                 has_genshin = "genshin" in ntext
                 matches = [name for name, tag in CHARACTERS
-                           if _adult_character_match(tag)
-                           and (_norm(name) in ntext or _norm(_base_character_tag(tag)) in ntext)]
+                           if _norm(name) in ntext or _norm(_base_character_tag(tag)) in ntext]
                 # Never claim a cosplay post is Genshin solely because it says "cosplay".
                 if not ((subreddit_is_genshin and matches) or (has_genshin and matches)):
                     continue
@@ -885,7 +858,7 @@ def _decode_spec(message: discord.Message) -> Spec | None:
                 extra_tags="" if extra == "-" else extra.replace("+", " "),
             )
         except (ValueError, IndexError):
-            return None
+            continue
     return None
 
 
@@ -937,14 +910,8 @@ async def run_search(session, spec: Spec) -> Outcome:
     sources = _pick_sources(spec)
 
     character_tag = spec.character
-    if character_tag and spec.rating != "safe" and not _adult_character_match(character_tag):
-        return Outcome("Adult-rated searches require adult characters.", None, [], time.monotonic() - started)
     if not character_tag and spec.kind != "cosplay":
-        eligible = (
-            [item for item in RESOLVED_CHARS if _adult_character_match(item[1])]
-            if spec.rating != "safe" else RESOLVED_CHARS
-        )
-        character_tag = random.choice(eligible)[1] if eligible else ""
+        character_tag = random.choice(RESOLVED_CHARS)[1] if RESOLVED_CHARS else ""
     display = CHAR_BY_TAG.get(character_tag, character_tag) if character_tag else None
 
     if spec.kind == "cosplay":
@@ -1016,13 +983,12 @@ def _render(spec: Spec, outcome: Outcome) -> tuple[list[discord.Embed], list[dis
         color=0x7B68EE
     )
 
-    summary.set_footer(
-        text=(
-            f"{outcome.query} · {len(files)} file(s) · "
-            f"{outcome.elapsed:.1f}s"
-            f"{FOOTER_SEP}{_encode_spec(spec)}"
-        )
-    )
+    # Keep the encoded settings last: a long tag list must never push them past
+    # Discord's 2048 character footer limit, or the buttons lose their state.
+    tail = f" · {len(files)} file(s) · {outcome.elapsed:.1f}s{FOOTER_SEP}{_encode_spec(spec)}"
+    room = 2048 - len(tail)
+    query = outcome.query if len(outcome.query) <= room else outcome.query[:max(1, room - 1)] + "…"
+    summary.set_footer(text=query + tail)
 
     embeds = [summary]
 
@@ -1081,12 +1047,37 @@ class ResultView(discord.ui.View):
             return False
         return True
 
+    async def on_error(self, interaction, error, item) -> None:
+        """Without this a raising callback is never acknowledged, so Discord
+        reports 'didn't respond in time' instead of the real failure."""
+        log.error(
+            "button %s failed: %s",
+            getattr(item, "custom_id", item),
+            error,
+            exc_info=(type(error), error, error.__traceback__),
+        )
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    "Something went wrong — try again.", ephemeral=True
+                )
+            else:
+                await interaction.response.send_message(
+                    "Something went wrong — try again.", ephemeral=True
+                )
+        except discord.HTTPException:
+            pass
+
     async def _spec(self, interaction) -> Spec | None:
+        # Acknowledge before anything slow runs, so the click is never left
+        # un-answered while the search is in flight.
         spec = _decode_spec(interaction.message)
         if spec is None:
             await interaction.response.send_message(
                 "Couldn't read this message's settings — run the command again.", ephemeral=True
             )
+            return None
+        await interaction.response.defer()
         return spec
 
     async def _swap(self, interaction, spec: Spec) -> None:
@@ -1103,21 +1094,18 @@ class ResultView(discord.ui.View):
         spec = await self._spec(interaction)
         if spec is None:
             return
-        await interaction.response.defer()
         await self._swap(interaction, spec)
 
     async def _new_girl(self, interaction: discord.Interaction) -> None:
         spec = await self._spec(interaction)
         if spec is None:
             return
-        await interaction.response.defer()
         await self._swap(interaction, replace(spec, character=""))
-    
+
     async def _spoiler(self, interaction: discord.Interaction) -> None:
         spec = await self._spec(interaction)
         if spec is None:
             return
-        await interaction.response.defer()
         spec = replace(spec, spoiler=not spec.spoiler)
         outcome = _RESULTS.get(interaction.message.id)
         if outcome is None:
@@ -1132,15 +1120,14 @@ class ResultView(discord.ui.View):
         spec = await self._spec(interaction)
         if spec is None:
             return
-        await interaction.response.defer()
         spec = replace(spec, count=min(spec.count, 5))
         outcome = await run_search(interaction.client.session, spec)
         if not outcome.results:
             await interaction.followup.send("Nothing new — try again in a second.", ephemeral=True)
             return
         embeds, files = _render(spec, outcome)
-        await interaction.followup.send(embeds=embeds, files=files, view=self)
-
+        message = await interaction.followup.send(embeds=embeds, files=files, view=self)
+        _remember(message.id, outcome)
 
 # --------------------------------------------------------------- bot setup
 
@@ -1448,10 +1435,6 @@ async def _cosplay(
         spoiler=spoiler,
         limit=_file_limit(interaction),
     )
-    # Avoid interrupting cosplay searches with an adult-character warning.
-    # Characters not verified as adults are automatically limited to safe media.
-    if spec.character and spec.rating != "safe" and not _adult_character_match(spec.character):
-        spec = replace(spec, rating="safe")
     if spec.rating != "safe" and not _channel_is_nsfw(interaction):
         await interaction.edit_original_response(
             content="Run adult-rated cosplay searches in an age-restricted Discord channel, or select rating:safe."
@@ -1555,12 +1538,15 @@ async def on_ready() -> None:
     if getattr(bot, "_startup_complete", False):
         return
 
+    # Register the persistent view first: until this runs, clicks have nothing
+    # to dispatch to and Discord reports "didn't respond in time".
+    bot.add_view(VIEW)
+    log.info("registered persistent result view")
+
     if not hasattr(bot, "session") or bot.session.closed:
         bot.session = aiohttp.ClientSession(
             headers={"User-Agent": UA}
         )
-
-    bot.add_view(VIEW)
 
     if GUILD_ID:
         guild = discord.Object(id=int(GUILD_ID))
