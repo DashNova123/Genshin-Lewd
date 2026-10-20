@@ -58,6 +58,7 @@ PAGE_BOUNDS: dict[tuple[str, str], int] = {}
 COUNTS: dict[str, int] = {}
 _LIMITERS: dict[str, "HostLimiter"] = {}
 _RESULTS: collections.OrderedDict[int, "Outcome"] = collections.OrderedDict()
+_BUSY_MESSAGES: set[int] = set()
 
 
 # --------------------------------------------------------------- utilities
@@ -219,6 +220,24 @@ CHARACTERS: list[tuple[str, str]] = [
 RESOLVED_CHARS: list[tuple[str, str]] = list(CHARACTERS)
 CHAR_BY_TAG: dict[str, str] = {tag: display for display, tag in CHARACTERS}
 
+# Adult-rated searches must never deliberately include child-coded characters.
+# Applies to both explicitly selected characters and posts tagged with them.
+CHILD_CODED_TAGS = frozenset({
+    "klee", "qiqi", "nahida", "sayu", "yaoyao", "kachina", "diona",
+})
+
+
+def _child_coded_character(tag: str) -> bool:
+    return _base_character_tag(tag) in CHILD_CODED_TAGS
+
+
+def _allowed_adult_post(post: dict) -> bool:
+    tags = post.get("tags", [])
+    if not tags:
+        # Can't verify the tags for an adult-rated item: reject it.
+        return False
+    return not any(_child_coded_character(tag) for tag in tags)
+
 
 def _base_character_tag(tag: str) -> str:
     return tag.split("_(genshin_impact)", 1)[0].lower().strip()
@@ -342,11 +361,14 @@ def _p_gelbooru(data) -> list[dict]:
         if not full:
             continue
         pid = p.get("id")
-        out.append(_mk_post(
+        item = _mk_post(
             "Gelbooru", pid, full, p.get("sample_url"), p.get("sample_url"),
             p.get("preview_url"), p.get("file_ext"), p.get("file_size"),
             f"https://gelbooru.com/index.php?page=post&s=view&id={pid}",
-        ))
+        )
+        tags = p.get("tags") or ""
+        item["tags"] = tags.split() if isinstance(tags, str) else tags if isinstance(tags, list) else []
+        out.append(item)
     return out
 
 
@@ -358,11 +380,14 @@ def _p_rule34(data) -> list[dict]:
         if not full:
             continue
         pid = p.get("id")
-        out.append(_mk_post(
+        item = _mk_post(
             "Rule34", pid, full, p.get("sample_url"), p.get("sample_url"),
             p.get("preview_url"), p.get("file_ext"), p.get("file_size"),
             f"https://rule34.xxx/index.php?page=post&s=view&id={pid}",
-        ))
+        )
+        tags = p.get("tags") or ""
+        item["tags"] = tags.split() if isinstance(tags, str) else tags if isinstance(tags, list) else []
+        out.append(item)
     return out
 
 
@@ -373,11 +398,14 @@ def _p_konachan(data) -> list[dict]:
         if not full:
             continue
         pid = p.get("id")
-        out.append(_mk_post(
+        item = _mk_post(
             "Konachan", pid, full, p.get("sample_url"), p.get("sample_url"),
             p.get("preview_url"), p.get("file_ext"), p.get("file_size"),
             f"https://konachan.com/post/show/{pid}",
-        ))
+        )
+        tags = p.get("tags") or ""
+        item["tags"] = tags.split() if isinstance(tags, str) else tags if isinstance(tags, list) else []
+        out.append(item)
     return out
 
 
@@ -640,7 +668,7 @@ def _matches(post: dict, mode: str) -> bool:
     return post["is_video"] if mode == "video" else not post["is_video"]
 
 
-async def _try_source(session, src: Source, tags: str, mode: str) -> dict | None:
+async def _try_source(session, src: Source, tags: str, mode: str, rating: str = "safe") -> dict | None:
     for _ in range(PAGE_TRIES):
         page = _random_page(src, tags)
         posts = await _fetch_page(session, src, tags, page)
@@ -651,14 +679,15 @@ async def _try_source(session, src: Source, tags: str, mode: str) -> dict | None
             continue
         if page > PAGE_BOUNDS.get((src.name, tags), 0):
             PAGE_BOUNDS[(src.name, tags)] = min(page, src.max_page)
-        good = [p for p in posts if _matches(p, mode)]
+        good = [p for p in posts if _matches(p, mode)
+                and (rating == "safe" or _allowed_adult_post(p))]
         if good:
             return random.choice(good)
     return None
 
 
 async def _gather(session, build: Callable[[Source], str], mode: str,
-                  sources: list[Source], count: int) -> list[dict]:
+                  sources: list[Source], count: int, rating: str = "safe") -> list[dict]:
     want = min(count + 2, MAX_FILES + 4)
     pool = sources[:]
     random.shuffle(pool)
@@ -674,7 +703,7 @@ async def _gather(session, build: Callable[[Source], str], mode: str,
     while len(picked) < want and attempts < cap and pool:
         attempts += 1
         src = random.choice(pool)
-        post = await _try_source(session, src, build(src), mode)
+        post = await _try_source(session, src, build(src), mode, rating)
         if post is None:
             fails[src.name] += 1
             if fails[src.name] >= 2 and len(pool) > 1:
@@ -870,26 +899,31 @@ def _pick_sources(spec: Spec) -> list[Source]:
     return out
 
 
-async def run_search(session, spec: Spec) -> Outcome:
+async def run_search(session, spec: Spec, *, previous_character: str | None = None) -> Outcome:
     started = time.monotonic()
     sources = _pick_sources(spec)
 
     character_tag = spec.character
+    if spec.rating != "safe" and character_tag and _child_coded_character(character_tag):
+        return Outcome(_display_query(spec, character_tag), None, [], time.monotonic() - started)
     if not character_tag and spec.kind != "cosplay":
-        character_tag = random.choice(RESOLVED_CHARS)[1] if RESOLVED_CHARS else ""
+        choices = [pair for pair in RESOLVED_CHARS
+                   if (spec.rating == "safe" or not _child_coded_character(pair[1]))
+                   and pair[0] != previous_character]
+        character_tag = random.choice(choices)[1] if choices else ""
     display = CHAR_BY_TAG.get(character_tag, character_tag) if character_tag else None
 
     if spec.kind == "cosplay":
         posts = await _gather_cosplay(session, spec)
     else:
-        posts = await _gather(session, _query_for(spec, character_tag), spec.mode, sources, spec.count) \
+        posts = await _gather(session, _query_for(spec, character_tag), spec.mode, sources, spec.count, spec.rating) \
             if sources else []
 
     if not posts and character_tag and spec.kind != "cosplay":
         log.info("no results for %r, retrying without the character tag",
                  _display_query(spec, character_tag))
         display = None
-        posts = await _gather(session, _query_for(spec, ""), spec.mode, sources, spec.count) \
+        posts = await _gather(session, _query_for(spec, ""), spec.mode, sources, spec.count, spec.rating) \
             if sources else []
 
     query = _display_query(spec, "" if display is None else character_tag)
@@ -988,7 +1022,7 @@ def _render(spec: Spec, outcome: Outcome) -> tuple[list[discord.Embed], list[dis
 # -------------------------------------------------------------- result view
 
 class ResultView(discord.ui.View):
-    """Stateless and persistent — parameters are read back out of the footer."""
+    """Persistent Discord buttons; search settings are restored from each embed."""
 
     def __init__(self) -> None:
         super().__init__(timeout=None)
@@ -1005,99 +1039,219 @@ class ResultView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         spec = _decode_spec(interaction.message)
-        if spec and interaction.user.id != spec.user_id:
+        if spec is None:
             await interaction.response.send_message(
-                "Not your search — run the command yourself.", ephemeral=True
+                "These buttons belong to an older or invalid result. Please run the command again.",
+                ephemeral=True,
+            )
+            return False
+        if interaction.user.id != spec.user_id:
+            await interaction.response.send_message(
+                "Not your search — run the command yourself.", ephemeral=True,
             )
             return False
         return True
 
     async def on_error(self, interaction, error, item) -> None:
-        """Without this a raising callback is never acknowledged, so Discord
-        reports 'didn't respond in time' instead of the real failure."""
         log.error(
-            "button %s failed: %s",
-            getattr(item, "custom_id", item),
-            error,
+            "Result button %s failed: %s", getattr(item, "custom_id", item), error,
             exc_info=(type(error), error, error.__traceback__),
         )
         try:
             if interaction.response.is_done():
                 await interaction.followup.send(
-                    "Something went wrong — try again.", ephemeral=True
+                    "Something went wrong. Check your FadeHost console logs and try again.",
+                    ephemeral=True,
                 )
             else:
                 await interaction.response.send_message(
-                    "Something went wrong — try again.", ephemeral=True
+                    "Something went wrong. Check your FadeHost console logs and try again.",
+                    ephemeral=True,
                 )
         except discord.HTTPException:
             pass
 
-    async def _spec(self, interaction) -> Spec | None:
-        # Acknowledge before anything slow runs, so the click is never left
-        # un-answered while the search is in flight.
+    async def _spec(self, interaction: discord.Interaction) -> Spec | None:
         spec = _decode_spec(interaction.message)
         if spec is None:
             await interaction.response.send_message(
-                "Couldn't read this message's settings — run the command again.", ephemeral=True
+                "Couldn't read the search settings. Run the slash command again.", ephemeral=True,
             )
             return None
-        await interaction.response.defer()
-        return spec
+        if interaction.message.id in _BUSY_MESSAGES:
+            await interaction.response.send_message(
+                "This result is already updating. Please wait a moment.", ephemeral=True,
+            )
+            return None
+        if spec.rating != "safe" and not _channel_is_nsfw(interaction):
+            await interaction.response.send_message(
+                "Adult-rated results can only be refreshed in age-restricted channels.", ephemeral=True,
+            )
+            return None
+        if spec.rating != "safe" and spec.character and _child_coded_character(spec.character):
+            await interaction.response.send_message(
+                "Adult-rated searches aren't available for that character.", ephemeral=True,
+            )
+            return None
 
-    async def _swap(self, interaction, spec: Spec) -> None:
-        outcome = await run_search(interaction.client.session, spec)
-        _remember(interaction.message.id, outcome)
-        embeds, files = _render(spec, outcome)
-        await interaction.edit_original_response(
-            embeds=embeds,
-            attachments=files,
-            view=VIEW,
+        _BUSY_MESSAGES.add(interaction.message.id)
+        try:
+            # For a button, this acknowledges the click WITHOUT creating a new
+            # loading message. We can then edit the message whose button was used.
+            await interaction.response.defer(thinking=False)
+        except Exception:
+            _BUSY_MESSAGES.discard(interaction.message.id)
+            raise
+        return replace(spec, limit=_file_limit(interaction))
+
+    async def _swap(self, interaction: discord.Interaction, spec: Spec,
+                    *, previous_character: str | None = None) -> None:
+        outcome = await run_search(
+            interaction.client.session, spec, previous_character=previous_character,
         )
+        if not any(blob is not None for _, blob, _, _ in outcome.results):
+            await interaction.followup.send(
+                "No new downloadable results were found. Try again or use fewer tags.",
+                ephemeral=True,
+            )
+            return
+        embeds, files = _render(spec, outcome)
+        # Edit *the actual message clicked*, including messages from /more.
+        await interaction.message.edit(embeds=embeds, attachments=files, view=VIEW)
+        _remember(interaction.message.id, outcome)
 
     async def _reroll(self, interaction: discord.Interaction) -> None:
         spec = await self._spec(interaction)
         if spec is None:
             return
-        await self._swap(interaction, spec)
+        try:
+            await self._swap(interaction, spec)
+        finally:
+            _BUSY_MESSAGES.discard(interaction.message.id)
 
     async def _new_girl(self, interaction: discord.Interaction) -> None:
         spec = await self._spec(interaction)
         if spec is None:
             return
-        await self._swap(interaction, replace(spec, character=""))
+        try:
+            current = _RESULTS.get(interaction.message.id)
+            previous = current.character if current else _character_from_embed(interaction.message)
+            await self._swap(
+                interaction, replace(spec, character=""), previous_character=previous,
+            )
+        finally:
+            _BUSY_MESSAGES.discard(interaction.message.id)
 
     async def _spoiler(self, interaction: discord.Interaction) -> None:
         spec = await self._spec(interaction)
         if spec is None:
             return
-        spec = replace(spec, spoiler=not spec.spoiler)
-        outcome = _RESULTS.get(interaction.message.id)
-        if outcome is None:
-            outcome = await run_search(interaction.client.session, spec)
+        try:
+            outcome = _RESULTS.get(interaction.message.id)
+            if outcome is None:
+                # Memory is erased on FadeHost restarts. Recover the exact files
+                # from Discord instead of silently rerolling different results.
+                outcome = await _recover_from_message(interaction.message, spec)
+                if outcome is None:
+                    await interaction.followup.send(
+                        "Couldn't reload those attachments. Please reroll this result first.",
+                        ephemeral=True,
+                    )
+                    return
+            spec = replace(spec, spoiler=not spec.spoiler)
+            embeds, files = _render(spec, outcome)
+            await interaction.message.edit(embeds=embeds, attachments=files, view=VIEW)
             _remember(interaction.message.id, outcome)
-        embeds, files = _render(spec, outcome)
-        await interaction.edit_original_response(
-            embeds=embeds,
-            attachments=files,
-        )
+        finally:
+            _BUSY_MESSAGES.discard(interaction.message.id)
+
     async def _more(self, interaction: discord.Interaction) -> None:
         spec = await self._spec(interaction)
         if spec is None:
             return
-        spec = replace(spec, count=min(spec.count, 5))
-        outcome = await run_search(interaction.client.session, spec)
-        if not outcome.results:
-            await interaction.followup.send("Nothing new — try again in a second.", ephemeral=True)
-            return
-        embeds, files = _render(spec, outcome)
-        message = await interaction.followup.send(embeds=embeds, files=files, view=self)
-        _remember(message.id, outcome)
+        try:
+            # The new message keeps the same original options/result count.
+            outcome = await run_search(interaction.client.session, spec)
+            if not any(blob is not None for _, blob, _, _ in outcome.results):
+                await interaction.followup.send(
+                    "No new downloadable results were found. Try again in a moment.",
+                    ephemeral=True,
+                )
+                return
+            embeds, files = _render(spec, outcome)
+            message = await interaction.followup.send(embeds=embeds, files=files, view=VIEW)
+            _remember(message.id, outcome)
+        finally:
+            _BUSY_MESSAGES.discard(interaction.message.id)
+
+
+def _character_from_embed(message: discord.Message) -> str | None:
+    if not message.embeds:
+        return None
+    title = message.embeds[0].title or ""
+    return title.split(" · ", 1)[1] if " · " in title else None
+
+
+async def _recover_from_message(message: discord.Message, spec: Spec) -> Outcome | None:
+    """Rebuild the cached result from Discord's media after the bot restarts."""
+    if not message.attachments or not message.embeds:
+        return None
+    source_by_number = {}
+    description = message.embeds[0].description or ""
+    for line in description.splitlines():
+        found = re.match(r"`(\d+)`\s+\[([^\]]+) #([^\]]+)\]\(([^)]+)\)", line)
+        if found:
+            number, site, pid, url = found.groups()
+            source_by_number[int(number)] = (site, pid, url)
+
+    results = []
+    for idx, attachment in enumerate(message.attachments, 1):
+        if attachment.size > spec.limit:
+            return None
+        try:
+            blob = await attachment.read(use_cached=True)
+        except (discord.HTTPException, asyncio.TimeoutError):
+            return None
+        if not blob:
+            return None
+        name = attachment.filename.removeprefix("SPOILER_")
+        extension = _ext_from_url(name)
+        site, pid, url = source_by_number.get(
+            idx, ("Discord", str(attachment.id), attachment.url),
+        )
+        post = _mk_post(
+            site, pid, attachment.url, attachment.url, attachment.url,
+            attachment.url, extension, len(blob), url,
+        )
+        results.append((post, blob, name, None))
+
+    if not results:
+        return None
+    return Outcome(
+        _display_query(spec, spec.character),
+        _character_from_embed(message), results, 0.0,
+    )
 
 # --------------------------------------------------------------- bot setup
 
 intents = discord.Intents.default()
-bot = discord.Client(intents=intents)
+
+
+class GenshinBot(discord.Client):
+    async def setup_hook(self) -> None:
+        # Register BEFORE Discord starts dispatching button clicks.
+        self.add_view(VIEW)
+        log.info("Registered persistent result buttons")
+        self.session = aiohttp.ClientSession(headers={"User-Agent": UA})
+
+    async def close(self) -> None:
+        session = getattr(self, "session", None)
+        if session is not None and not session.closed:
+            await session.close()
+        await super().close()
+
+
+bot = GenshinBot(intents=intents)
 tree = app_commands.CommandTree(bot)
 
 
@@ -1291,6 +1445,11 @@ async def _genshin(
         "explicit",
     )
 
+    if spec.rating != "safe" and spec.character and _child_coded_character(spec.character):
+        await interaction.edit_original_response(
+            content="Adult-rated searches aren't available for that character. Choose rating:safe."
+        )
+        return
     if spec.rating != "safe" and not _channel_is_nsfw(interaction):
         await interaction.edit_original_response(
             content="Use an age-restricted channel for adult-rated searches, or select rating:safe."
@@ -1400,6 +1559,11 @@ async def _cosplay(
         spoiler=spoiler,
         limit=_file_limit(interaction),
     )
+    if spec.rating != "safe" and spec.character and _child_coded_character(spec.character):
+        await interaction.edit_original_response(
+            content="Adult-rated searches aren't available for that character. Choose rating:safe."
+        )
+        return
     if spec.rating != "safe" and not _channel_is_nsfw(interaction):
         await interaction.edit_original_response(
             content="Run adult-rated cosplay searches in an age-restricted Discord channel, or select rating:safe."
@@ -1502,16 +1666,6 @@ async def on_ready() -> None:
 
     if getattr(bot, "_startup_complete", False):
         return
-
-    # Register the persistent view first: until this runs, clicks have nothing
-    # to dispatch to and Discord reports "didn't respond in time".
-    bot.add_view(VIEW)
-    log.info("registered persistent result view")
-
-    if not hasattr(bot, "session") or bot.session.closed:
-        bot.session = aiohttp.ClientSession(
-            headers={"User-Agent": UA}
-        )
 
     if GUILD_ID:
         guild = discord.Object(id=int(GUILD_ID))
