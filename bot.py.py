@@ -1033,11 +1033,12 @@ class ResultView(discord.ui.View):
 
     @staticmethod
     def _mk(label, emoji, style, code, callback) -> discord.ui.Button:
-        button = discord.ui.Button(label=label, emoji=emoji, style=style, custom_id=f"gs:{code}")
-        button.callback = callback
-        return button
+        # The buttons are handled centrally by GenshinBot.on_interaction.
+        # Do not also attach a View callback: two listeners could acknowledge
+        # the same interaction and make buttons intermittently fail.
+        return discord.ui.Button(label=label, emoji=emoji, style=style, custom_id=f"gs:{code}")
 
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+    async def validate_interaction(self, interaction: discord.Interaction) -> bool:
         spec = _decode_spec(interaction.message)
         if spec is None:
             await interaction.response.send_message(
@@ -1239,10 +1240,46 @@ intents = discord.Intents.default()
 
 class GenshinBot(discord.Client):
     async def setup_hook(self) -> None:
-        # Register BEFORE Discord starts dispatching button clicks.
-        self.add_view(VIEW)
-        log.info("Registered persistent result buttons")
+        # Route component clicks directly. This also handles older result
+        # messages after a bot restart, without depending on view registration.
+        log.info("BUTTON_FIX_V2 active: direct component interaction routing")
         self.session = aiohttp.ClientSession(headers={"User-Agent": UA})
+
+    async def on_interaction(self, interaction: discord.Interaction) -> None:
+        if interaction.type != discord.InteractionType.component:
+            return
+        payload = interaction.data
+        if not isinstance(payload, dict):
+            return
+        custom_id = payload.get("custom_id", "")
+        callbacks = {
+            "gs:r": VIEW._reroll,
+            "gs:m": VIEW._more,
+            "gs:s": VIEW._spoiler,
+            "gs:n": VIEW._new_girl,
+        }
+        callback = callbacks.get(custom_id)
+        if callback is None:
+            return
+        log.info(
+            "BUTTON_FIX_V2 received %s from user %s on message %s",
+            custom_id, interaction.user.id,
+            getattr(interaction.message, "id", "unknown"),
+        )
+        try:
+            if not await VIEW.validate_interaction(interaction):
+                return
+            await callback(interaction)
+        except Exception:
+            log.exception("BUTTON_FIX_V2 action %s crashed", custom_id)
+            try:
+                message = "Button error. Please check the FadeHost console logs."
+                if interaction.response.is_done():
+                    await interaction.followup.send(message, ephemeral=True)
+                else:
+                    await interaction.response.send_message(message, ephemeral=True)
+            except discord.HTTPException:
+                log.exception("BUTTON_FIX_V2 could not report the error in Discord")
 
     async def close(self) -> None:
         session = getattr(self, "session", None)
