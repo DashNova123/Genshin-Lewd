@@ -12,6 +12,11 @@ import logging
 import os
 import random
 import time
+import sqlite3
+import uuid
+from contextlib import closing
+from datetime import datetime, timezone
+from pathlib import Path
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
@@ -59,6 +64,30 @@ COUNTS: dict[str, int] = {}
 _LIMITERS: dict[str, "HostLimiter"] = {}
 _RESULTS: collections.OrderedDict[int, "Outcome"] = collections.OrderedDict()
 _BUSY_MESSAGES: set[int] = set()
+
+# Save files next to bot.py by default. On FadeHost this directory MUST be
+# persistent and writable; set FAVORITES_DIR to a persistent path if necessary.
+FAVORITES_DIR = Path(os.getenv("FAVORITES_DIR") or Path(__file__).resolve().parent).resolve()
+FAVORITES_DB = FAVORITES_DIR / "favorites.sqlite3"
+FAVORITES_MEDIA = FAVORITES_DIR / "favorites_media"
+MAX_USER_FAVORITES = 250
+
+# Custom button emojis (server emojis visible to the bot).
+BUTTON_EMOJI_IDS = {
+    "reroll": 1562142048658657310,
+    "more": 1562144444386508970,
+    "spoiler": 1562145840385101936,
+    "new_girl": 1562141334075346996,
+    "favorite": 1562144325641568356,
+}
+
+
+def _button_emoji(key: str, fallback: str, name: str | None = None) -> str | discord.PartialEmoji:
+    emoji_id = BUTTON_EMOJI_IDS.get(key)
+    if not emoji_id:
+        return fallback
+    emoji_name = name or key
+    return discord.PartialEmoji(name=emoji_name, id=emoji_id)
 
 
 # --------------------------------------------------------------- utilities
@@ -1026,10 +1055,11 @@ class ResultView(discord.ui.View):
 
     def __init__(self) -> None:
         super().__init__(timeout=None)
-        self.add_item(self._mk("Reroll", "🎲", discord.ButtonStyle.primary, "r", self._reroll))
-        self.add_item(self._mk("More", "➕", discord.ButtonStyle.secondary, "m", self._more))
-        self.add_item(self._mk("Spoiler", "🙈", discord.ButtonStyle.secondary, "s", self._spoiler))
-        self.add_item(self._mk("New girl", "🔀", discord.ButtonStyle.secondary, "n", self._new_girl))
+        self.add_item(self._mk("Reroll", _button_emoji("reroll", "🎲", "reroll"), discord.ButtonStyle.primary, "r", self._reroll))
+        self.add_item(self._mk("More", _button_emoji("more", "➕", "more"), discord.ButtonStyle.secondary, "m", self._more))
+        self.add_item(self._mk("Spoiler", _button_emoji("spoiler", "🙈", "spoiler"), discord.ButtonStyle.secondary, "s", self._spoiler))
+        self.add_item(self._mk("New girl", _button_emoji("new_girl", "🔀", "newgirl"), discord.ButtonStyle.secondary, "n", self._new_girl))
+        self.add_item(self._mk("Favorite", _button_emoji("favorite", "❤️", "favorite"), discord.ButtonStyle.success, "f", self._favorite))
 
     @staticmethod
     def _mk(label, emoji, style, code, callback) -> discord.ui.Button:
@@ -1166,6 +1196,51 @@ class ResultView(discord.ui.View):
         finally:
             _BUSY_MESSAGES.discard(interaction.message.id)
 
+    async def _favorite(self, interaction: discord.Interaction) -> None:
+        """Present one item per option; saving happens on selection."""
+        if interaction.message.id in _BUSY_MESSAGES:
+            await interaction.response.send_message(
+                "Please wait for the current result update to finish.", ephemeral=True,
+            )
+            return
+        spec = _decode_spec(interaction.message)
+        if spec and spec.rating != "safe" and not _channel_is_nsfw(interaction):
+            await interaction.response.send_message(
+                "Favorites from adult-rated results require an age-restricted channel.",
+                ephemeral=True,
+            )
+            return
+        attachments = list(interaction.message.attachments)
+        if not attachments:
+            await interaction.response.send_message(
+                "This result has no downloadable files to save.", ephemeral=True,
+            )
+            return
+        source_map = _source_by_number(interaction.message)
+        options = []
+        for i, attachment in enumerate(attachments[:MAX_FILES], 1):
+            site, post_id, _ = source_map.get(i, ("Discord", str(attachment.id), ""))
+            label = f"{i:02d} · {site} #{post_id}"[:100]
+            options.append(discord.SelectOption(
+                label=label,
+                value=f"{i}:{attachment.id}",
+                description=("Video" if _ext_from_url(attachment.filename) in VIDEO_EXTS else "Image")
+                + f" · {attachment.size // 1024} KB",
+            ))
+        picker = discord.ui.View(timeout=None)
+        picker.add_item(discord.ui.Select(
+            placeholder="Choose ONE image or video to save",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id=f"fav:save:{interaction.message.id}:{interaction.user.id}",
+        ))
+        await interaction.response.send_message(
+            "Select the exact image or video you'd like to favorite:",
+            view=picker,
+            ephemeral=True,
+        )
+
     async def _more(self, interaction: discord.Interaction) -> None:
         spec = await self._spec(interaction)
         if spec is None:
@@ -1233,6 +1308,291 @@ async def _recover_from_message(message: discord.Message, spec: Spec) -> Outcome
         _character_from_embed(message), results, 0.0,
     )
 
+# -------------------------------------------------------------- favorites
+
+def _init_favorites() -> None:
+    """SQLite metadata plus local media files persist across bot restarts."""
+    FAVORITES_DIR.mkdir(parents=True, exist_ok=True)
+    FAVORITES_MEDIA.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(FAVORITES_DB, timeout=20)) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS favorites (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                source_key TEXT NOT NULL,
+                site TEXT NOT NULL,
+                post_id TEXT NOT NULL,
+                source_url TEXT NOT NULL,
+                character TEXT NOT NULL,
+                rating TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                stored_filename TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(user_id, source_key)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS ix_favorites_user ON favorites(user_id, id DESC)")
+        conn.commit()
+
+
+def _db() -> sqlite3.Connection:
+    conn = sqlite3.connect(FAVORITES_DB, timeout=20)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _favorites_for(user_id: int) -> list[dict]:
+    with closing(_db()) as conn:
+        return [dict(row) for row in conn.execute(
+            "SELECT * FROM favorites WHERE user_id=? ORDER BY id DESC", (str(user_id),),
+        ).fetchall()]
+
+
+def _favorite_source_key(site: str, post_id: str) -> str:
+    return f"{site.lower()}:{post_id}"
+
+
+def _store_favorite(user_id: int, post: dict, blob: bytes, filename: str,
+                    *, character: str, rating: str, kind: str) -> tuple[str, int]:
+    """Returns (created/already/limit, id). A disk copy, not a hotlink, is saved."""
+    site, pid = str(post.get("site", "Discord")), str(post.get("id", ""))
+    key = _favorite_source_key(site, pid)
+    with closing(_db()) as conn:
+        existing = conn.execute(
+            "SELECT id FROM favorites WHERE user_id=? AND source_key=?",
+            (str(user_id), key),
+        ).fetchone()
+        if existing:
+            return "already", existing["id"]
+        count = conn.execute(
+            "SELECT COUNT(*) FROM favorites WHERE user_id=?", (str(user_id),),
+        ).fetchone()[0]
+        if count >= MAX_USER_FAVORITES:
+            return "limit", 0
+
+        extension = _ext_from_url(filename)
+        if extension not in IMAGE_EXTS | VIDEO_EXTS:
+            raise ValueError("Unsupported favorite media type")
+        saved_name = f"{uuid.uuid4().hex}.{extension}"
+        target = FAVORITES_MEDIA / saved_name
+        temp_path = FAVORITES_MEDIA / (saved_name + ".part")
+        try:
+            temp_path.write_bytes(blob)
+            temp_path.replace(target)
+            conn.execute("""
+                INSERT INTO favorites
+                (user_id, source_key, site, post_id, source_url, character,
+                 rating, kind, filename, stored_filename, size_bytes, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                str(user_id), key, site, pid, str(post.get("page", "")),
+                character, rating, kind, Path(filename).name, saved_name,
+                len(blob), datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            ))
+            conn.commit()
+            fav_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        except sqlite3.IntegrityError:
+            target.unlink(missing_ok=True)
+            existing = conn.execute(
+                "SELECT id FROM favorites WHERE user_id=? AND source_key=?",
+                (str(user_id), key),
+            ).fetchone()
+            if existing:
+                return "already", existing["id"]
+            raise
+        except Exception:
+            target.unlink(missing_ok=True)
+            raise
+        finally:
+            temp_path.unlink(missing_ok=True)
+    return "created", fav_id
+
+
+def _remove_favorite(user_id: int, fav_id: int) -> bool:
+    with closing(_db()) as conn:
+        row = conn.execute(
+            "SELECT stored_filename FROM favorites WHERE id=? AND user_id=?",
+            (fav_id, str(user_id)),
+        ).fetchone()
+        if not row:
+            return False
+        conn.execute("DELETE FROM favorites WHERE id=? AND user_id=?", (fav_id, str(user_id)))
+        conn.commit()
+    (FAVORITES_MEDIA / row["stored_filename"]).unlink(missing_ok=True)
+    return True
+
+
+def _source_by_number(message: discord.Message) -> dict[int, tuple[str, str, str]]:
+    result = {}
+    if not message.embeds:
+        return result
+    for line in (message.embeds[0].description or "").splitlines():
+        found = re.match(r"`(\d+)`\s+\[([^\]]+) #([^\]]+)\]\(([^)]+)\)", line)
+        if found:
+            number, site, pid, url = found.groups()
+            result[int(number)] = (site, pid, url)
+    return result
+
+
+def _favorite_browser_view(user_id: int, fav_id: int, index: int, total: int) -> discord.ui.View:
+    """Custom IDs are enough; GenshinBot routes clicks even after restarts."""
+    view = discord.ui.View(timeout=None)
+    for label, emoji, action, disabled, style in (
+        ("Previous", "⬅️", "prev", index == 0, discord.ButtonStyle.secondary),
+        ("Next", "➡️", "next", index >= total - 1, discord.ButtonStyle.secondary),
+        ("Remove", "🗑️", "remove", False, discord.ButtonStyle.danger),
+    ):
+        view.add_item(discord.ui.Button(
+            label=label, emoji=emoji, style=style, disabled=disabled,
+            custom_id=f"fav:browse:{action}:{user_id}:{fav_id}",
+        ))
+    return view
+
+
+async def _favorite_browser_payload(user_id: int, target_id: int | None = None
+                                   ) -> tuple[discord.Embed, discord.File, discord.ui.View] | None:
+    rows = await asyncio.to_thread(_favorites_for, user_id)
+    if not rows:
+        return None
+    index = next((i for i, row in enumerate(rows) if row["id"] == target_id), 0)
+    row = rows[index]
+    media_path = FAVORITES_MEDIA / row["stored_filename"]
+    try:
+        blob = await asyncio.to_thread(media_path.read_bytes)
+    except OSError:
+        log.exception("Favorite file missing: %s", media_path)
+        raise FileNotFoundError(f"Favorite #{row['id']} media is missing on FadeHost")
+    file = discord.File(io.BytesIO(blob), filename=row["filename"])
+    embed = discord.Embed(
+        title=f"❤️ Favorites · {index + 1}/{len(rows)}",
+        description=f"**Favorite ID:** `{row['id']}`\n"
+                    f"**Character:** {discord.utils.escape_markdown(row['character'] or 'Unknown')}\n"
+                    f"**Source:** {discord.utils.escape_markdown(row['site'])} #{discord.utils.escape_markdown(row['post_id'])}\n"
+                    f"**Type:** {'Video' if _ext_from_url(row['filename']) in VIDEO_EXTS else 'Image'}\n"
+                    f"**Saved:** {row['created_at'][:10]} (UTC)",
+        color=0xE85A83,
+    )
+    if row["source_url"].startswith(("https://", "http://")):
+        embed.add_field(name="Original post", value=f"[View source]({row['source_url']})", inline=False)
+    if _ext_from_url(row["filename"]) in IMAGE_EXTS:
+        embed.set_image(url=f"attachment://{file.filename}")
+    return embed, file, _favorite_browser_view(user_id, row["id"], index, len(rows))
+
+
+async def _handle_favorite_save(interaction: discord.Interaction, custom_id: str) -> None:
+    """Validate the original message and save exactly one selected attachment."""
+    try:
+        _, _, message_id_text, owner_text = custom_id.split(":", 3)
+        message_id, owner_id = int(message_id_text), int(owner_text)
+    except ValueError:
+        await interaction.response.send_message("Invalid favorite selection.", ephemeral=True)
+        return
+    if interaction.user.id != owner_id:
+        await interaction.response.send_message("This isn't your favorite selector.", ephemeral=True)
+        return
+    values = (interaction.data or {}).get("values", [])
+    try:
+        index_text, attachment_id_text = values[0].split(":", 1)
+        index, attachment_id = int(index_text), int(attachment_id_text)
+    except (ValueError, IndexError, AttributeError):
+        await interaction.response.send_message("Choose a valid media item.", ephemeral=True)
+        return
+    await interaction.response.defer(thinking=False)
+    # Fetch the ORIGINAL public result rather than the ephemeral select message.
+    original = await interaction.channel.fetch_message(message_id)
+    spec = _decode_spec(original)
+    if spec is None or spec.user_id != owner_id:
+        await interaction.followup.send("The original result is no longer valid.", ephemeral=True)
+        return
+    if spec.rating != "safe" and not _channel_is_nsfw(interaction):
+        await interaction.followup.send("Use an age-restricted channel to save this result.", ephemeral=True)
+        return
+    attachments = original.attachments
+    if not (1 <= index <= len(attachments)) or attachments[index - 1].id != attachment_id:
+        await interaction.followup.send(
+            "That result changed. Click ❤️ Favorite again to choose from the current files.",
+            ephemeral=True,
+        )
+        return
+    attachment = attachments[index - 1]
+    if attachment.size > _file_limit(interaction):
+        await interaction.followup.send("That file is too large for this bot to save.", ephemeral=True)
+        return
+    name = attachment.filename.removeprefix("SPOILER_")
+    if _ext_from_url(name) not in IMAGE_EXTS | VIDEO_EXTS:
+        await interaction.followup.send("Unsupported file type.", ephemeral=True)
+        return
+    source_map = _source_by_number(original)
+    site, pid, url = source_map.get(index, ("Discord", str(attachment.id), attachment.url))
+    post = {"site": site, "id": pid, "page": url}
+    blob = await attachment.read(use_cached=True)
+    if not blob:
+        await interaction.followup.send("Couldn't download that attachment.", ephemeral=True)
+        return
+    status, fav_id = await asyncio.to_thread(
+        _store_favorite, owner_id, post, blob, name,
+        character=_character_from_embed(original) or "", rating=spec.rating,
+        kind=spec.kind,
+    )
+    if status == "created":
+        reply = f"❤️ Saved item {index} as favorite **#{fav_id}**! Open `/favorites` to view it."
+    elif status == "already":
+        reply = f"Already saved as favorite **#{fav_id}**."
+    else:
+        reply = f"You've reached {MAX_USER_FAVORITES} favorites. Remove an old one first."
+    await interaction.followup.send(reply, ephemeral=True)
+
+
+async def _handle_favorite_browse(interaction: discord.Interaction, custom_id: str) -> None:
+    try:
+        _, _, action, owner_text, selected_text = custom_id.split(":", 4)
+        owner_id, current_id = int(owner_text), int(selected_text)
+    except ValueError:
+        await interaction.response.send_message("Invalid favorites button.", ephemeral=True)
+        return
+    if interaction.user.id != owner_id:
+        await interaction.response.send_message("These aren't your favorites.", ephemeral=True)
+        return
+    if not _channel_is_nsfw(interaction):
+        await interaction.response.send_message(
+            "Browse your saved media in an age-restricted channel.", ephemeral=True,
+        )
+        return
+    if action not in ("prev", "next", "remove"):
+        await interaction.response.send_message("Unknown favorites action.", ephemeral=True)
+        return
+    await interaction.response.defer(thinking=False)
+    rows = await asyncio.to_thread(_favorites_for, owner_id)
+    pos = next((i for i, row in enumerate(rows) if row["id"] == current_id), None)
+    if action == "remove":
+        if pos is not None:
+            await asyncio.to_thread(_remove_favorite, owner_id, current_id)
+        remaining = await asyncio.to_thread(_favorites_for, owner_id)
+        next_id = remaining[min(pos or 0, len(remaining) - 1)]["id"] if remaining else None
+    elif not rows:
+        next_id = None
+    else:
+        if pos is None:
+            pos = 0
+        pos = max(0, min(len(rows) - 1, pos + (-1 if action == "prev" else 1)))
+        next_id = rows[pos]["id"]
+    if next_id is None:
+        await interaction.edit_original_response(
+            content="You don't have any favorites yet. Use ❤️ Favorite on a search result.",
+            embeds=[], attachments=[], view=None,
+        )
+        return
+    payload = await _favorite_browser_payload(owner_id, next_id)
+    if payload is None:
+        await interaction.edit_original_response(
+            content="Your favorites list is empty.", embeds=[], attachments=[], view=None,
+        )
+    else:
+        embed, file, view = payload
+        await interaction.edit_original_response(content=None, embeds=[embed], attachments=[file], view=view)
+
 # --------------------------------------------------------------- bot setup
 
 intents = discord.Intents.default()
@@ -1243,6 +1603,8 @@ class GenshinBot(discord.Client):
         # Route component clicks directly. This also handles older result
         # messages after a bot restart, without depending on view registration.
         log.info("BUTTON_FIX_V2 active: direct component interaction routing")
+        await asyncio.to_thread(_init_favorites)
+        log.info("FAVORITES_V1 ready: database %s", FAVORITES_DB)
         self.session = aiohttp.ClientSession(headers={"User-Agent": UA})
 
     async def on_interaction(self, interaction: discord.Interaction) -> None:
@@ -1257,9 +1619,10 @@ class GenshinBot(discord.Client):
             "gs:m": VIEW._more,
             "gs:s": VIEW._spoiler,
             "gs:n": VIEW._new_girl,
+            "gs:f": VIEW._favorite,
         }
         callback = callbacks.get(custom_id)
-        if callback is None:
+        if callback is None and not custom_id.startswith(("fav:save:", "fav:browse:")):
             return
         log.info(
             "BUTTON_FIX_V2 received %s from user %s on message %s",
@@ -1267,9 +1630,14 @@ class GenshinBot(discord.Client):
             getattr(interaction.message, "id", "unknown"),
         )
         try:
-            if not await VIEW.validate_interaction(interaction):
-                return
-            await callback(interaction)
+            if custom_id.startswith("fav:save:"):
+                await _handle_favorite_save(interaction, custom_id)
+            elif custom_id.startswith("fav:browse:"):
+                await _handle_favorite_browse(interaction, custom_id)
+            else:
+                if not await VIEW.validate_interaction(interaction):
+                    return
+                await callback(interaction)
         except Exception:
             log.exception("BUTTON_FIX_V2 action %s crashed", custom_id)
             try:
@@ -1692,6 +2060,53 @@ tree.add_command(app_commands.Command(
     name="presets", description="List the built-in /genshin presets.", callback=_presets
 ))
 
+
+# ------------------------------------------------------------- favorites commands
+
+@app_commands.describe(page="Favorite number in your collection (newest first)")
+async def _favorites(interaction: discord.Interaction,
+                     page: app_commands.Range[int, 1, 250] = 1) -> None:
+    """View saved images/videos; browsing and removal use persistent buttons."""
+    if not _channel_is_nsfw(interaction):
+        await interaction.response.send_message(
+            "Browse favorites in an age-restricted channel.", ephemeral=True,
+        )
+        return
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    rows = await asyncio.to_thread(_favorites_for, interaction.user.id)
+    if not rows:
+        await interaction.followup.send(
+            "No favorites yet! Use the ❤️ Favorite button on any result, then choose an item.",
+            ephemeral=True,
+        )
+        return
+    selected = rows[min(page - 1, len(rows) - 1)]["id"]
+    payload = await _favorite_browser_payload(interaction.user.id, selected)
+    if payload:
+        embed, file, view = payload
+        await interaction.followup.send(embed=embed, file=file, view=view, ephemeral=True)
+
+
+tree.add_command(app_commands.Command(
+    name="favorites", description="Browse your personally saved images and videos.", callback=_favorites,
+))
+
+
+@app_commands.describe(id="Favorite ID shown by /favorites")
+async def _unfavorite(interaction: discord.Interaction, id: int) -> None:
+    if id <= 0:
+        await interaction.response.send_message("Enter a valid favorite ID.", ephemeral=True)
+        return
+    removed = await asyncio.to_thread(_remove_favorite, interaction.user.id, id)
+    await interaction.response.send_message(
+        f"🗑️ Removed favorite #{id}." if removed else "Favorite not found in your collection.",
+        ephemeral=True,
+    )
+
+
+tree.add_command(app_commands.Command(
+    name="unfavorite", description="Remove one favorite by its ID.", callback=_unfavorite,
+))
 
 # ------------------------------------------------------------------- runtime
 
