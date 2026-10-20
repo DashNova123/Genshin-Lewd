@@ -33,10 +33,11 @@ TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 GUILD_ID = os.getenv("GUILD_ID", "").strip()
 GELBOORU_API_KEY = os.getenv("GELBOORU_API_KEY", "").strip()
 GELBOORU_USER_ID = os.getenv("GELBOORU_USER_ID", "").strip()
-# Optional: only use Reddit after receiving Reddit Data API approval.
+# Required for /cosplay — it is the only cosplay source.
 REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID", "").strip()
 REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET", "").strip()
 REDDIT_USER_AGENT = os.getenv("REDDIT_USER_AGENT", "GenshinCosplayDiscordBot/1.0").strip()
+COSPLAY_SUBREDDIT = os.getenv("COSPLAY_SUBREDDIT", "GenshinImpactNSFW").strip()
 
 UA = "GenshinBooruBot/3.0"
 VIDEO_EXTS = {"mp4", "webm"}
@@ -224,7 +225,7 @@ def _base_character_tag(tag: str) -> str:
 
 
 def _cosplay_tags_match(post: dict, spec: "Spec") -> bool:
-    # Danbooru's structured tags are checked locally, not just the displayed title.
+    # Kept for reference: no longer used now that cosplay comes from Reddit.
     if post.get("site") != "Danbooru":
         return False
     tags = set(post.get("tags", []))
@@ -432,7 +433,7 @@ SOURCES: list[Source] = [
 ]
 
 
-# --- Approved Reddit Data API: optional Genshin-only cosplay source ---------
+# --- Approved Reddit Data API: the only cosplay source ----------------------
 
 async def _reddit_cosplay_posts(session: aiohttp.ClientSession, spec: "Spec", count: int) -> list[dict]:
     """Use Reddit ONLY with approved OAuth credentials; do not scrape Reddit pages."""
@@ -455,12 +456,14 @@ async def _reddit_cosplay_posts(session: aiohttp.ClientSession, spec: "Spec", co
             return []
 
         headers = {"User-Agent": REDDIT_USER_AGENT, "Authorization": f"bearer {token}"}
-        # Genshin-specific subreddit plus a larger adult cosplay community.
+        # One subreddit, two ways in: newest posts, plus a cosplay-targeted
+        # search so a run of art posts cannot crowd the cosplay out.
         searches = [
-            ("GenshinImpactCosplays", "new", None),
-            ("nsfwcosplay", "search", "genshin"),
+            (COSPLAY_SUBREDDIT, "new", None),
+            (COSPLAY_SUBREDDIT, "search", "cosplay"),
         ]
         choices: list[dict] = []
+        seen_ids: set[str] = set()
         for subreddit, operation, query in searches:
             if operation == "new":
                 url = f"https://oauth.reddit.com/r/{subreddit}/new"
@@ -484,18 +487,14 @@ async def _reddit_cosplay_posts(session: aiohttp.ClientSession, spec: "Spec", co
                     continue
                 title = html.unescape(str(p.get("title", "")))
                 flair = html.unescape(str(p.get("link_flair_text") or ""))
-                text = title + " " + flair
-                ntext = _norm(text)
-                subreddit_is_genshin = subreddit.lower() == "genshinimpactcosplays"
-                has_genshin = "genshin" in ntext
-                matches = [name for name, tag in CHARACTERS
-                           if _norm(name) in ntext or _norm(_base_character_tag(tag)) in ntext]
-                # Never claim a cosplay post is Genshin solely because it says "cosplay".
-                if not ((subreddit_is_genshin and matches) or (has_genshin and matches)):
+                ntext = _norm(title + " " + flair)
+                # This sub posts art and clips too — cosplay only, nothing else.
+                if "cosplay" not in ntext:
                     continue
                 if spec.character and not any(
                     _norm(_base_character_tag(spec.character)) == _norm(_base_character_tag(tag))
-                    for name, tag in CHARACTERS if name in matches
+                    for name, tag in CHARACTERS
+                    if _norm(name) in ntext or _norm(_base_character_tag(tag)) in ntext
                 ):
                     continue
                 if spec.rating == "safe" and p.get("over_18"):
@@ -524,8 +523,9 @@ async def _reddit_cosplay_posts(session: aiohttp.ClientSession, spec: "Spec", co
                 if spec.mode == "image" and is_video:
                     continue
                 pid = str(p.get("id") or "")
-                if not pid or not url.startswith("https://"):
+                if not pid or pid in seen_ids or not url.startswith("https://"):
                     continue
+                seen_ids.add(pid)
                 post = _mk_post(
                     "Reddit", pid, url, url, url, url, ext, 0,
                     "https://www.reddit.com" + str(p.get("permalink") or ""),
@@ -539,60 +539,25 @@ async def _reddit_cosplay_posts(session: aiohttp.ClientSession, spec: "Spec", co
 
 
 async def _gather_cosplay(session: aiohttp.ClientSession, spec: "Spec") -> list[dict]:
-    """Only verified Genshin cosplay media, never substitute drawn artwork."""
-    source = next(s for s in SOURCES if s.name == "Danbooru")
-    tags = "genshin_impact cosplay_photo"
-    count = await _danbooru_count(session, tags)
-    page_count = (
-        max(1, min(source.max_page, (count + DANBOORU_PAGE_SIZE - 1) // DANBOORU_PAGE_SIZE))
-        if count else 1
-    )
+    """Reddit only — r/GenshinImpactNSFW cosplay posts, never drawn artwork."""
+    if not (REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET):
+        return []
 
-    # Recent pages plus random deeper pages for variety; limit API requests.
-    pages = list(range(1, min(page_count, 3) + 1))
-    if page_count > 3:
-        max_extra = 13 if spec.mode == "video" else 5
-        pages += random.sample(range(4, page_count + 1), min(max_extra, page_count - 3))
-    random.shuffle(pages)
-
-    reddit_task = None
-    if REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET:
-        reddit_task = asyncio.create_task(
-            _reddit_cosplay_posts(session, spec, spec.count + 4)
-        )
+    posts = await _reddit_cosplay_posts(session, spec, spec.count + 6)
 
     picked: list[dict] = []
-    seen = set()
-    wanted = min(spec.count + 4, MAX_FILES)
-    for start in range(0, len(pages), 4):
-        batch = pages[start:start + 4]
-        responses = await asyncio.gather(
-            *(_fetch_page(session, source, tags, page) for page in batch)
-        )
-        eligible = [p for results in responses if results
-                    for p in results if _cosplay_tags_match(p, spec)]
-        random.shuffle(eligible)
-        for post in eligible:
-            key = (post["site"], post["id"])
-            if key in seen or (key in RECENT and len(picked) >= spec.count):
-                continue
-            seen.add(key)
-            picked.append(post)
-            if len(picked) >= wanted:
-                break
-        if len(picked) >= wanted:
-            break
+    seen: set[tuple] = set()
+    for post in posts:
+        key = (post["site"], post["id"])
+        if key in seen:
+            continue
+        seen.add(key)
+        if key in RECENT and len(picked) < spec.count:
+            continue
+        picked.append(post)
 
-    if reddit_task is not None:
-        for post in await reddit_task:
-            key = (post["site"], post["id"])
-            if key not in seen:
-                seen.add(key)
-                picked.append(post)
-
-    random.shuffle(picked)
     RECENT.extend(seen)
-    return picked[:min(spec.count + 6, MAX_FILES + 4)]
+    return picked[:MAX_FILES + 4]
 
 
 # ------------------------------------------------------------- fetch layer
@@ -880,7 +845,7 @@ def _query_for(spec: Spec, character_tag: str) -> Callable[[Source], str]:
 def _display_query(spec: Spec, character_tag: str) -> str:
     parts = ["genshin_impact"]
     if spec.kind == "cosplay":
-        parts.append("cosplay_photo")
+        parts.append("cosplay")
     if character_tag:
         parts.append(character_tag)
     if spec.rating and spec.rating != "any":
