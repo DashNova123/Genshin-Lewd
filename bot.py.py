@@ -52,8 +52,15 @@ CONCURRENCY = 4
 HEADROOM = 64 * 1024
 DEFAULT_LIMIT = 8 * 1024 * 1024
 PAGE_TRIES = 2
+# Short, bounded searches/downloads: prevent slow hosts from stalling commands.
+TOTAL_FETCH_BUDGET = 9.0
+PRIMARY_SEARCH_BUDGET = 3.3
+FALLBACK_SEARCH_BUDGET = 1.7
+COSPLAY_SEARCH_BUDGET = 5.0
+PAGE_REQUEST_TIMEOUT = 2.5
+MEDIA_REQUEST_TIMEOUT = 4.0
 DANBOORU_PAGE_SIZE = 100
-RESULT_CACHE_MAX = 25
+RESULT_CACHE_MAX = 10
 FOOTER_SEP = "  \u27e9  "
 
 RECENT = collections.deque(maxlen=800)
@@ -64,6 +71,7 @@ COUNTS: dict[str, int] = {}
 _LIMITERS: dict[str, "HostLimiter"] = {}
 _RESULTS: collections.OrderedDict[int, "Outcome"] = collections.OrderedDict()
 _BUSY_MESSAGES: set[int] = set()
+_REDDIT_TOKEN: tuple[str, float] | None = None
 
 # Save files next to bot.py by default. On FadeHost this directory MUST be
 # persistent and writable; set FAVORITES_DIR to a persistent path if necessary.
@@ -190,7 +198,6 @@ def _mk_post(site, pid, full, sample, preview, thumb, ext, size, page) -> dict:
     }
 
 
-
 def _pick_ext(post: dict, ctype: str) -> str:
     ctype = ctype.lower().split(";")[0].strip()
 
@@ -211,39 +218,35 @@ def _pick_ext(post: dict, ctype: str) -> str:
     return ext if ext in VIDEO_EXTS else "jpg"
 
 
-
 # ------------------------------------------------------------ character list
 
 # Bare names. Resolved at startup against Danbooru's character tag index, which
 # supplies the `_(genshin_impact)` disambiguator where one exists.
 CHARACTERS: list[tuple[str, str]] = [
-    ("Aloy", "aloy"), ("Amber", "amber"), ("Arlecchino", "arlecchino"),
-    ("Barbara", "barbara"), ("Beidou", "beidou"), ("Candace", "candace"),
-    ("Charlotte", "charlotte"), ("Chasca", "chasca"), ("Chevreuse", "chevreuse"),
-    ("Chiori", "chiori"), ("Citlali", "citlali"), ("Clorinde", "clorinde"),
-    ("Collei", "collei"), ("Columbina", "columbina"), ("Dehya", "dehya"),
-    ("Emilie", "emilie"), ("Escoffier", "escoffier"),
-    ("Eula", "eula"), ("Faruzan", "faruzan"), ("Fischl", "fischl"),
-    ("Furina", "furina"), ("Ganyu", "ganyu"), ("Hu Tao", "hu_tao"),
-    ("Ineffa", "ineffa"), ("Jahoda", "jahoda"),
-    ("Jean", "jean"), ("Kachina", "kachina"), ("Kamisato Ayaka", "kamisato_ayaka"),
-    ("Keqing", "keqing"), ("Kirara", "kirara"), ("Klee", "klee"),
-    ("Kujou Sara", "kujou_sara"), ("Kuki Shinobu", "kuki_shinobu"), ("La Signora", "la_signora"),
-    ("Lan Yan", "lan_yan"), ("Lauma", "lauma"), ("Layla", "layla"),
-    ("Linnea", "linnea"), ("Lisa", "lisa"), ("Lumine", "lumine"),
-    ("Lynette", "lynette"), ("Mavuika", "mavuika"), ("Mona", "mona"),
-    ("Mualani", "mualani"), ("Nahida", "nahida"), ("Navia", "navia"),
-    ("Nefer", "nefer"), ("Nicole", "nicole"), ("Nilou", "nilou"),
-    ("Ningguang", "ningguang"), ("Noelle", "noelle"), ("Odette", "odette"),
-    ("Paimon", "paimon"), ("Qiqi", "qiqi"), ("Raiden Shogun", "raiden_shogun"),
-    ("Rosaria", "rosaria"), ("Sandrone", "sandrone"), ("Sangonomiya Kokomi", "sangonomiya_kokomi"),
-    ("Sayu", "sayu"), ("Shenhe", "shenhe"), ("Skirk", "skirk"),
-    ("Sucrose", "sucrose"), ("Varesa", "varesa"), ("Vesna", "vesna"),
-    ("Vodyanitsa", "vodyanitsa"), ("Xianyun", "xianyun"), ("Xiangling", "xiangling"),
-    ("Xilonen", "xilonen"), ("Xinyan", "xinyan"), ("Yae Miko", "yae_miko"),
-    ("Yanfei", "yanfei"), ("Yaoyao", "yaoyao"), ("Yelan", "yelan"),
-    ("Yoimiya", "yoimiya"), ("Yumemizuki Mizuki", "yumemizuki_mizuki"), ("Yun Jin", "yun_jin"),
-    ("Zibai", "zibai"),
+    ('Aloy', 'aloy'), ('Amber', 'amber'), ('Arlecchino', 'arlecchino'),
+    ('Barbara', 'barbara'), ('Beidou', 'beidou'), ('Candace', 'candace'),
+    ('Charlotte', 'charlotte'), ('Chasca', 'chasca'), ('Chevreuse', 'chevreuse'),
+    ('Chiori', 'chiori'), ('Citlali', 'citlali'), ('Clorinde', 'clorinde'),
+    ('Collei', 'collei'), ('Columbina', 'columbina'), ('Dehya', 'dehya'),
+    ('Emilie', 'emilie'), ('Escoffier', 'escoffier'), ('Eula', 'eula'),
+    ('Faruzan', 'faruzan'), ('Fischl', 'fischl'), ('Furina', 'furina'),
+    ('Ganyu', 'ganyu'), ('Hu Tao', 'hu_tao'), ('Ineffa', 'ineffa'),
+    ('Jahoda', 'jahoda'), ('Jean', 'jean'), ('Kamisato Ayaka', 'kamisato_ayaka'),
+    ('Keqing', 'keqing'), ('Kirara', 'kirara'), ('Kujou Sara', 'kujou_sara'),
+    ('Kuki Shinobu', 'kuki_shinobu'), ('La Signora', 'la_signora'), ('Lan Yan', 'lan_yan'),
+    ('Lauma', 'lauma'), ('Layla', 'layla'), ('Linnea', 'linnea'),
+    ('Lisa', 'lisa'), ('Lumine', 'lumine'), ('Lynette', 'lynette'),
+    ('Mavuika', 'mavuika'), ('Mona', 'mona'), ('Mualani', 'mualani'),
+    ('Navia', 'navia'), ('Nefer', 'nefer'), ('Nicole', 'nicole'),
+    ('Nilou', 'nilou'), ('Ningguang', 'ningguang'), ('Noelle', 'noelle'),
+    ('Odette', 'odette'), ('Raiden Shogun', 'raiden_shogun'), ('Rosaria', 'rosaria'),
+    ('Sandrone', 'sandrone'), ('Sangonomiya Kokomi', 'sangonomiya_kokomi'), ('Shenhe', 'shenhe'),
+    ('Skirk', 'skirk'), ('Sucrose', 'sucrose'), ('Varesa', 'varesa'),
+    ('Vesna', 'vesna'), ('Vodyanitsa', 'vodyanitsa'), ('Xianyun', 'xianyun'),
+    ('Xiangling', 'xiangling'), ('Xilonen', 'xilonen'), ('Xinyan', 'xinyan'),
+    ('Yae Miko', 'yae_miko'), ('Yanfei', 'yanfei'), ('Yelan', 'yelan'),
+    ('Yoimiya', 'yoimiya'), ('Yumemizuki Mizuki', 'yumemizuki_mizuki'), ('Yun Jin', 'yun_jin'),
+    ('Zibai', 'zibai'),
 ]
 
 RESOLVED_CHARS: list[tuple[str, str]] = list(CHARACTERS)
@@ -252,55 +255,89 @@ CHAR_BY_TAG: dict[str, str] = {tag: display for display, tag in CHARACTERS}
 # Adult-rated searches must never deliberately include child-coded characters.
 # Applies to both explicitly selected characters and posts tagged with them.
 CHILD_CODED_TAGS = frozenset({
-    "klee", "qiqi", "nahida", "sayu", "yaoyao", "kachina", "diona",
+    "aino", "diona", "dori", "iansan", "kachina", "klee",
+    "nahida", "prune", "qiqi", "sayu", "sigewinne", "yaoyao",
+    "paimon",  # Additional child-coded nonplayable character.
 })
 
-
-def _child_coded_character(tag: str) -> bool:
-    return _base_character_tag(tag) in CHILD_CODED_TAGS
-
-
-def _allowed_adult_post(post: dict) -> bool:
-    tags = post.get("tags", [])
-    if not tags:
-        # Can't verify the tags for an adult-rated item: reject it.
-        return False
-    return not any(_child_coded_character(tag) for tag in tags)
+# Legacy adult-designation tags from this version; they do NOT override
+# CHILD_CODED_TAGS exclusions when filtering posts.
+ADULT_TAGS = frozenset({
+    "amber", "barbara", "collei", "fischl", "jahoda", "kamisato_ayaka",
+    "kirara", "lan_yan", "layla", "linnea", "lynette", "mualani", "noelle",
+    "odette", "sucrose", "varesa", "vesna", "vodyanitsa", "xiangling",
+    "xinyan",
+})
 
 
 def _base_character_tag(tag: str) -> str:
     return tag.split("_(genshin_impact)", 1)[0].lower().strip()
 
 
-def _cosplay_tags_match(post: dict, spec: "Spec") -> bool:
-    # Kept for reference: no longer used now that cosplay comes from Reddit.
-    if post.get("site") != "Danbooru":
-        return False
-    tags = set(post.get("tags", []))
-    if "genshin_impact" not in tags or "cosplay_photo" not in tags:
-        return False
+def _child_coded_character(tag: str) -> bool:
+    return _base_character_tag(tag) in CHILD_CODED_TAGS
 
-    if spec.character:
-        characters = {_base_character_tag(tag) for tag in post.get("character_tags", [])}
-        if _base_character_tag(spec.character) not in characters:
-            return False
 
-    rating = post.get("rating", "").lower()
-    # Danbooru uses g=general, s=sensitive, q=questionable, e=explicit.
-    if spec.rating == "safe" and rating not in ("g", "s"):
-        return False
-    if spec.rating == "questionable" and rating != "q":
-        return False
-    if spec.rating == "explicit" and rating != "e":
-        return False
+def _adult_character(tag: str) -> bool:
+    return _base_character_tag(tag) in ADULT_TAGS
 
-    for tag in spec.extra_tags.replace(",", " ").split():
-        if tag.startswith("-"):
-            if tag[1:] in tags:
-                return False
-        elif tag not in tags:
-            return False
-    return _matches(post, spec.mode)
+
+# Exclude posts containing known male characters or male-presence tags.
+# These are separate filtering rules: existing character and safety lists stay intact.
+MALE_CHARACTER_TAGS = frozenset({
+    "aether", "albedo", "alhaitham", "arataki_itto", "baizhu", "bennett",
+    "chongyun", "cyno", "dainsleif", "diluc", "dottore", "il_dottore",
+    "freminet", "gaming", "gorou", "il_capitano", "capitano", "kaedehara_kazuha",
+    "kaeya", "kamisato_ayato", "kinich", "lyney", "mika", "mitya",
+    "neuvillette", "ororon", "pantalone", "pierro", "razor", "scaramouche",
+    "sethos", "shikanoin_heizou", "tartaglia", "childe", "thoma", "tighnari",
+    "varka", "venti", "wanderer", "wriothesley", "xiao", "xingqiu",
+    "zhongli", "lohen", "valeriy", "teppei", "enjou", "ruu",
+})
+MALE_PRESENCE_TAGS = frozenset({
+    "1boy", "2boys", "3boys", "4boys", "5boys", "6+boys", "multiple_boys",
+    "1man", "2men", "multiple_males", "male", "male_only", "male_focus",
+    "male_character", "male_protagonist", "male_pov", "male_hands",
+    "faceless_male", "boy", "boys", "man", "men", "otoko",
+})
+
+
+def _male_tagged_post(post: dict) -> bool:
+    tags = (* (post.get("tags") or []), * (post.get("character_tags") or []))
+    names = {_base_character_tag(str(tag)) for tag in tags}
+    return bool(names & (MALE_CHARACTER_TAGS | MALE_PRESENCE_TAGS)) or any(
+        re.fullmatch(r"[1-9][0-9]*(?:boys?|men)", name) for name in names
+    )
+
+
+def _reddit_male_mentioned(title: str, flair: str) -> bool:
+    # Reddit has titles/flairs rather than structured booru character tags.
+    label = (title + " " + flair).casefold().replace("_", " ")
+    if set(re.findall(r"[a-z0-9]+", label)) & {"male", "men", "boy", "boys", "guy", "guys", "man"}:
+        return True
+    for name in MALE_CHARACTER_TAGS:
+        candidate = name.replace("_", " ")
+        if re.search(r"(?<![a-z0-9])" + re.escape(candidate) + r"(?![a-z0-9])", label):
+            return True
+    return False
+
+
+def _explicit_blocked(character_tag: str) -> bool:
+    """Never allow an explicitly selected blocked child-coded character."""
+    return bool(character_tag) and _child_coded_character(character_tag)
+
+
+def _allowed_adult_post(post: dict) -> bool:
+    # Any blocked character disqualifies a post, even in mixed-character images.
+    # Danbooru exposes character tags separately; check both fields so one
+    # missing or incomplete field cannot override the exclusion.
+    tags = post.get("tags") or []
+    if not tags:
+        return False
+    character_tags = post.get("character_tags") or []
+    return (not any(_child_coded_character(tag) for tag in (*tags, *character_tags))
+            and not _male_tagged_post(post))
+
 
 POPULAR_TAGS = [
     "solo", "1girl", "swimsuit", "bikini", "lingerie", "nude", "topless",
@@ -313,6 +350,14 @@ POPULAR_TAGS = [
     "doggystyle", "missionary", "cowgirl_position", "creampie", "cum",
     "censored", "uncensored", "animated", "video", "webm", "faceless_male",
     "yuri", "harem", "bondage", "see-through", "photo_(medium)", "feet",
+]
+
+# Cosplay is matched against Reddit post titles, not booru tags, so the generic
+# booru vocabulary mostly misses. Keep this list to words that show up in titles.
+COSPLAY_TAGS = [
+    "cosplay", "bikini", "swimsuit", "beach", "pool", "lingerie", "nude",
+    "lewd", "maid", "bunny", "kimono", "yukata", "wet", "bath", "onsen",
+    "stockings", "thighhighs", "self", "video",
 ]
 
 PRESETS: dict[str, dict[str, str]] = {
@@ -492,107 +537,140 @@ SOURCES: list[Source] = [
 
 # --- Approved Reddit Data API: the only cosplay source ----------------------
 
+async def _reddit_token(session: aiohttp.ClientSession) -> str | None:
+    """Client-credentials token, cached until shortly before it expires."""
+    global _REDDIT_TOKEN
+    if _REDDIT_TOKEN and _REDDIT_TOKEN[1] > time.time() + 60:
+        return _REDDIT_TOKEN[0]
+
+    await _limiter("oauth.reddit.com", 1.0).wait()
+    try:
+        async with session.post(
+            "https://www.reddit.com/api/v1/access_token",
+            auth=aiohttp.BasicAuth(REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET),
+            data={"grant_type": "client_credentials"},
+            headers={"User-Agent": REDDIT_USER_AGENT},
+            timeout=aiohttp.ClientTimeout(total=2.5),
+        ) as response:
+            if response.status != 200:
+                log.warning("Reddit OAuth failed: HTTP %s", response.status)
+                return None
+            data = await response.json()
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        log.warning("Reddit OAuth unreachable")
+        return None
+
+    token = data.get("access_token")
+    if not token:
+        return None
+    _REDDIT_TOKEN = (token, time.time() + _int(data.get("expires_in")) - 60)
+    return token
+
+
 async def _reddit_cosplay_posts(session: aiohttp.ClientSession, spec: "Spec", count: int) -> list[dict]:
     """Use Reddit ONLY with approved OAuth credentials; do not scrape Reddit pages."""
     if not (REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET):
         return []
-    try:
-        auth = aiohttp.BasicAuth(REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET)
-        async with session.post(
-            "https://www.reddit.com/api/v1/access_token",
-            auth=auth,
-            data={"grant_type": "client_credentials"},
-            headers={"User-Agent": REDDIT_USER_AGENT},
-            timeout=aiohttp.ClientTimeout(total=15),
-        ) as response:
-            if response.status != 200:
-                log.warning("Reddit OAuth failed: HTTP %s", response.status)
-                return []
-            token = (await response.json()).get("access_token")
-        if not token:
-            return []
 
-        headers = {"User-Agent": REDDIT_USER_AGENT, "Authorization": f"bearer {token}"}
-        # One subreddit, two ways in: newest posts, plus a cosplay-targeted
-        # search so a run of art posts cannot crowd the cosplay out.
-        searches = [
-            (COSPLAY_SUBREDDIT, "new", None),
-            (COSPLAY_SUBREDDIT, "search", "cosplay"),
-        ]
-        choices: list[dict] = []
-        seen_ids: set[str] = set()
-        for subreddit, operation, query in searches:
-            if operation == "new":
-                url = f"https://oauth.reddit.com/r/{subreddit}/new"
-                params = {"limit": 100, "raw_json": 1}
-            else:
-                url = f"https://oauth.reddit.com/r/{subreddit}/search"
-                params = {"q": query, "restrict_sr": 1, "sort": "new", "limit": 100, "raw_json": 1}
+    token = await _reddit_token(session)
+    if not token:
+        return []
+
+    headers = {"User-Agent": REDDIT_USER_AGENT, "Authorization": f"bearer {token}"}
+    # One subreddit, two ways in: newest posts, plus a cosplay-targeted
+    # search so a run of art posts cannot crowd the cosplay out.
+    searches = [
+        (COSPLAY_SUBREDDIT, "new", None),
+        (COSPLAY_SUBREDDIT, "search", "cosplay"),
+    ]
+    choices: list[dict] = []
+    seen_ids: set[str] = set()
+    async def fetch_listing(subreddit: str, operation: str, query: str | None) -> dict:
+        if operation == "new":
+            url = f"https://oauth.reddit.com/r/{subreddit}/new"
+            params = {"limit": 100, "raw_json": 1}
+        else:
+            url = f"https://oauth.reddit.com/r/{subreddit}/search"
+            params = {"q": query, "restrict_sr": 1, "sort": "new", "limit": 100, "raw_json": 1}
+        try:
+            await _limiter("oauth.reddit.com", 1.0).wait()
             async with session.get(
                 url, headers=headers, params=params,
-                timeout=aiohttp.ClientTimeout(total=20),
+                timeout=aiohttp.ClientTimeout(total=2.75),
             ) as response:
                 if response.status != 200:
                     log.info("Reddit r/%s: HTTP %s", subreddit, response.status)
-                    continue
-                data = await response.json()
+                    return {}
+                return await response.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            log.info("Reddit r/%s unreachable", subreddit)
+            return {}
 
-            children = data.get("data", {}).get("children", [])
-            for entry in children:
-                p = entry.get("data", {})
-                if p.get("removed_by_category") or p.get("is_self"):
-                    continue
-                title = html.unescape(str(p.get("title", "")))
-                flair = html.unescape(str(p.get("link_flair_text") or ""))
-                ntext = _norm(title + " " + flair)
-                # This sub posts art and clips too — cosplay only, nothing else.
-                if "cosplay" not in ntext:
-                    continue
-                if spec.character and not any(
-                    _norm(_base_character_tag(spec.character)) == _norm(_base_character_tag(tag))
-                    for name, tag in CHARACTERS
-                    if _norm(name) in ntext or _norm(_base_character_tag(tag)) in ntext
-                ):
-                    continue
-                if spec.rating == "safe" and p.get("over_18"):
-                    continue
-                if spec.rating in ("explicit", "questionable") and not p.get("over_18"):
-                    continue
-                if spec.extra_tags and not all(
-                    _norm(t) in ntext for t in spec.extra_tags.replace(",", " ").split()
-                ):
-                    continue
+    # Request both Reddit listing paths concurrently without changing filtering.
+    listings = await asyncio.gather(
+        *(fetch_listing(subreddit, operation, query)
+          for subreddit, operation, query in searches)
+    )
+    for data in listings:
+        children = data.get("data", {}).get("children", [])
+        for entry in children:
+            p = entry.get("data", {})
+            if p.get("removed_by_category") or p.get("is_self"):
+                continue
+            title = html.unescape(str(p.get("title", "")))
+            flair = html.unescape(str(p.get("link_flair_text") or ""))
+            ntext = _norm(title + " " + flair)
+            # Reddit cosplay entries lack booru character tags; exclude known
+            # child-coded character names mentioned in their title or flair.
+            if any(_norm(tag) in ntext for tag in CHILD_CODED_TAGS):
+                continue
+            if _reddit_male_mentioned(title, flair):
+                continue
+            # This sub posts art and clips too — cosplay only, nothing else.
+            if "cosplay" not in ntext:
+                continue
+            if spec.character and not any(
+                _norm(_base_character_tag(spec.character)) == _norm(_base_character_tag(tag))
+                for name, tag in CHARACTERS
+                if _norm(name) in ntext or _norm(_base_character_tag(tag)) in ntext
+            ):
+                continue
+            if spec.rating == "safe" and p.get("over_18"):
+                continue
+            if spec.rating in ("explicit", "questionable") and not p.get("over_18"):
+                continue
+            if spec.extra_tags and not all(
+                _norm(t) in ntext for t in spec.extra_tags.replace(",", " ").split()
+            ):
+                continue
 
-                vinfo = ((p.get("secure_media") or p.get("media") or {})
-                         .get("reddit_video") or {})
-                video_url = html.unescape(vinfo.get("fallback_url") or "")
-                if video_url:
-                    url = video_url
-                    ext = "mp4"
-                else:
-                    url = html.unescape(str(p.get("url_overridden_by_dest") or p.get("url") or ""))
-                    ext = _ext_from_url(url)
-                    if ext not in IMAGE_EXTS:
-                        continue
-                is_video = ext in VIDEO_EXTS
-                if spec.mode == "video" and not is_video:
+            vinfo = ((p.get("secure_media") or p.get("media") or {})
+                     .get("reddit_video") or {})
+            video_url = html.unescape(vinfo.get("fallback_url") or "")
+            if video_url:
+                url = video_url
+                ext = "mp4"
+            else:
+                url = html.unescape(str(p.get("url_overridden_by_dest") or p.get("url") or ""))
+                ext = _ext_from_url(url)
+                if ext not in IMAGE_EXTS:
                     continue
-                if spec.mode == "image" and is_video:
-                    continue
-                pid = str(p.get("id") or "")
-                if not pid or pid in seen_ids or not url.startswith("https://"):
-                    continue
-                seen_ids.add(pid)
-                post = _mk_post(
-                    "Reddit", pid, url, url, url, url, ext, 0,
-                    "https://www.reddit.com" + str(p.get("permalink") or ""),
-                )
-                choices.append(post)
-        random.shuffle(choices)
-        return choices[:count]
-    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
-        log.warning("Reddit cosplay API unavailable: %s", type(exc).__name__)
-        return []
+            is_video = ext in VIDEO_EXTS
+            if spec.mode == "video" and not is_video:
+                continue
+            if spec.mode == "image" and is_video:
+                continue
+            pid = str(p.get("id") or "")
+            if not pid or pid in seen_ids or not url.startswith("https://"):
+                continue
+            seen_ids.add(pid)
+            post = _mk_post(
+                "Reddit", pid, url, url, url, url, ext, 0,
+                "https://www.reddit.com" + str(p.get("permalink") or ""),
+            )
+            choices.append(post)
+    random.shuffle(choices)
+    return choices[:count]
 
 
 async def _gather_cosplay(session: aiohttp.ClientSession, spec: "Spec") -> list[dict]:
@@ -620,7 +698,7 @@ async def _gather_cosplay(session: aiohttp.ClientSession, spec: "Spec") -> list[
 # ------------------------------------------------------------- fetch layer
 
 async def _fetch_page(session: aiohttp.ClientSession, src: Source, tags: str, page: int):
-    """Parsed posts for one page, or None if the page should be retried."""
+    """Parsed posts for one page; a slow host must not hold up the entire search."""
     key = (src.name, tags, page)
     cached = CACHE.get(key)
     if cached is not None:
@@ -628,42 +706,37 @@ async def _fetch_page(session: aiohttp.ClientSession, src: Source, tags: str, pa
 
     limiter = _limiter(src.host, src.min_interval)
 
-    for attempt in range(3):
+    for attempt in range(2):
         await limiter.wait()
         try:
             async with session.get(
                 src.url,
                 params=src.params(tags, page),
-                timeout=aiohttp.ClientTimeout(total=20),
+                timeout=aiohttp.ClientTimeout(total=PAGE_REQUEST_TIMEOUT),
             ) as r:
                 if r.status == 429:
                     log.debug("%s: rate limited on page %s", src.name, page)
-                    await asyncio.sleep(1.2 + attempt * 1.5 + random.random())
-                    continue
+                    # Do not block the other sites for a long backoff.
+                    return None
                 if r.status in (404, 410):
                     _cache_put(key, [])
                     return []
                 if r.status != 200:
                     log.debug("%s: HTTP %s (page %s)", src.name, r.status, page)
-                    await asyncio.sleep(0.35)
                     continue
-                text = await r.text()
+                body = await r.text()
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             log.debug("%s: %s (page %s)", src.name, type(exc).__name__, page)
-            await asyncio.sleep(0.35)
             continue
 
-        if not text.strip():
-            posts: list[dict] = []
-        else:
-            try:
-                posts = src.parse(json.loads(text))
-            except (ValueError, TypeError):
-                continue
-
+        if not body.strip():
+            return []
+        try:
+            posts = src.parse(json.loads(body))
+        except (ValueError, TypeError):
+            continue
         _cache_put(key, posts)
         return posts
-
     return None
 
 
@@ -675,7 +748,7 @@ async def _danbooru_count(session, tags: str) -> int | None:
         async with session.get(
             "https://danbooru.donmai.us/counts/posts.json",
             params={"tags": tags},
-            timeout=aiohttp.ClientTimeout(total=15),
+            timeout=aiohttp.ClientTimeout(total=1.5),
         ) as r:
             if r.status != 200:
                 return None
@@ -687,78 +760,127 @@ async def _danbooru_count(session, tags: str) -> int | None:
     return total
 
 
-def _random_page(src: Source, tags: str) -> int:
-    hi = PAGE_BOUNDS.get((src.name, tags), src.max_page)
-    return random.randint(1, max(1, hi))
-
 def _matches(post: dict, mode: str) -> bool:
     if mode == "any":
         return True
     return post["is_video"] if mode == "video" else not post["is_video"]
 
 
-async def _try_source(session, src: Source, tags: str, mode: str, rating: str = "safe") -> dict | None:
-    for _ in range(PAGE_TRIES):
-        page = _random_page(src, tags)
+async def _try_source(session, src: Source, tags: str, mode: str,
+                      rating: str = "safe", want: int = 3) -> list[dict]:
+    """Use known page counts or a small adaptive window; avoid empty high pages."""
+    key = (src.name, tags)
+
+    if key not in PAGE_BOUNDS:
+        if src.name == "Danbooru":
+            total = await _danbooru_count(session, tags)
+            if total:
+                PAGE_BOUNDS[key] = max(
+                    1, min(src.max_page, (total + DANBOORU_PAGE_SIZE - 1) // DANBOORU_PAGE_SIZE)
+                )
+        # Sites without a count endpoint start near page 1, not page 200-600.
+        PAGE_BOUNDS.setdefault(key, min(src.max_page, 3))
+
+    attempted_pages: set[int] = set()
+    for attempt in range(PAGE_TRIES):
+        upper = PAGE_BOUNDS[key]
+        if attempt == 0 and (src.name, tags, 1) not in CACHE:
+            page = 1
+        else:
+            choices = [p for p in range(1, upper + 1) if p not in attempted_pages]
+            if not choices:
+                break
+            page = random.choice(choices)
+        attempted_pages.add(page)
+
         posts = await _fetch_page(session, src, tags, page)
-        if posts is None:
+        if posts is None:  # Timeout/rate limit: don't mistake it for the last page.
             continue
         if not posts:
-            PAGE_BOUNDS[(src.name, tags)] = max(1, page - 1)
+            # An empty page means later pages are unlikely to contain results.
+            PAGE_BOUNDS[key] = min(PAGE_BOUNDS[key], max(1, page - 1))
             continue
-        if page > PAGE_BOUNDS.get((src.name, tags), 0):
-            PAGE_BOUNDS[(src.name, tags)] = min(page, src.max_page)
+
+        # A short API page is the end of the available results for this query.
+        if len(posts) < DANBOORU_PAGE_SIZE:
+            PAGE_BOUNDS[key] = min(PAGE_BOUNDS[key], page)
+        elif (page == PAGE_BOUNDS[key] and PAGE_BOUNDS[key] < src.max_page
+              and not (src.name == "Danbooru" and COUNTS.get(tags, 0) > 0)):
+            # Expand only after a full page proves the current window too small.
+            PAGE_BOUNDS[key] = min(src.max_page, PAGE_BOUNDS[key] * 2)
+
         good = [p for p in posts if _matches(p, mode)
-                and (rating == "safe" or _allowed_adult_post(p))]
+                and _allowed_adult_post(p)]
         if good:
-            return random.choice(good)
-    return None
+            random.shuffle(good)
+            return good[:want]
+    return []
 
 
 async def _gather(session, build: Callable[[Source], str], mode: str,
-                  sources: list[Source], count: int, rating: str = "safe") -> list[dict]:
+                  sources: list[Source], count: int, rating: str = "safe",
+                  budget: float = PRIMARY_SEARCH_BUDGET) -> list[dict]:
+    """Search independent sources concurrently; return the first useful pool."""
     want = min(count + 2, MAX_FILES + 4)
     pool = sources[:]
     random.shuffle(pool)
-    fails: collections.Counter[str] = collections.Counter()
+    tasks = {
+        asyncio.create_task(_try_source(session, src, build(src), mode, rating, want))
+        for src in pool
+    }
+    pending = set(tasks)
+    candidates: list[dict] = []
+    deadline = time.monotonic() + max(0.0, budget)
+    try:
+        while pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            done, pending = await asyncio.wait(
+                pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+            )
+            if not done:
+                break
+            for task in done:
+                try:
+                    candidates.extend(task.result())
+                except Exception as exc:
+                    log.debug("One art source failed: %s", type(exc).__name__)
+            seen_now = {(p["site"], p["id"]) for p in candidates
+                        if (p["site"], p["id"]) not in RECENT}
+            if len(seen_now) >= want:
+                break
+    finally:
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
-    if any(s.name == "Danbooru" for s in pool):
-        await _danbooru_count(session, build(next(s for s in pool if s.name == "Danbooru")))
-
-    picked: list[dict] = []
-    seen: set[tuple] = set()
-    attempts, cap = 0, want * 6 + 10
-
-    while len(picked) < want and attempts < cap and pool:
-        attempts += 1
-        src = random.choice(pool)
-        post = await _try_source(session, src, build(src), mode, rating)
-        if post is None:
-            fails[src.name] += 1
-            if fails[src.name] >= 2 and len(pool) > 1:
-                pool.remove(src)
-            continue
-        fails[src.name] = 0
-        key = (post["site"], post["id"])
-        if key in seen:
-            continue
-        seen.add(key)
-        if key in RECENT and attempts < want * 4:
-            continue
-        picked.append(post)
-
-    RECENT.extend(seen)
+    # Prefer unseen posts, then fill with repeats when the pool is small.
+    unique: dict[tuple, dict] = {}
+    for post in candidates:
+        unique.setdefault((post["site"], post["id"]), post)
+    fresh = [p for key, p in unique.items() if key not in RECENT]
+    repeats = [p for key, p in unique.items() if key in RECENT]
+    random.shuffle(fresh)
+    random.shuffle(repeats)
+    picked = (fresh + repeats)[:want]
+    RECENT.extend((p["site"], p["id"]) for p in picked)
     return picked
-async def _download(session, post: dict, limit: int, sem: asyncio.Semaphore):
-    urls = [
-        post["full"] if post["is_video"]
-        else (post["preview"] or post["full"])
-    ]
 
+
+async def _download(session, post: dict, limit: int, sem: asyncio.Semaphore):
     if post["is_video"]:
+        urls = [post["full"]]
         for alt in (post["sample"], post["preview"]):
             if alt and alt not in urls:
                 urls.append(alt)
+    else:
+        # Prefer the sample, but always keep the full image as a fallback so a
+        # dead sample URL doesn't cost us a perfectly good result.
+        urls = [u for u in (post["preview"], post["full"]) if u]
+        if not urls:
+            urls = [post["full"]]
 
     reason = "unreachable"
 
@@ -772,7 +894,7 @@ async def _download(session, post: dict, limit: int, sem: asyncio.Semaphore):
                         if post["site"] == "Gelbooru"
                         else None
                     ),
-                    timeout=aiohttp.ClientTimeout(total=90)
+                    timeout=aiohttp.ClientTimeout(total=MEDIA_REQUEST_TIMEOUT)
                 ) as r:
                     if r.status != 200:
                         reason = f"HTTP {r.status}"
@@ -785,7 +907,18 @@ async def _download(session, post: dict, limit: int, sem: asyncio.Semaphore):
                         reason = f"{clen // 1024} KB"
                         continue
 
-                    blob = await r.read()
+                    # Stop reading as soon as a response exceeds the upload limit,
+                    # even if the server omits or misreports Content-Length.
+                    chunks = bytearray()
+                    async for chunk in r.content.iter_chunked(64 * 1024):
+                        if len(chunks) + len(chunk) > limit:
+                            reason = f">{limit // 1024} KB"
+                            chunks = None
+                            break
+                        chunks.extend(chunk)
+                    if chunks is None:
+                        continue
+                    blob = bytes(chunks)
 
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 reason = type(exc).__name__
@@ -930,44 +1063,86 @@ def _pick_sources(spec: Spec) -> list[Source]:
 
 async def run_search(session, spec: Spec, *, previous_character: str | None = None) -> Outcome:
     started = time.monotonic()
+    deadline = started + TOTAL_FETCH_BUDGET
     sources = _pick_sources(spec)
 
     character_tag = spec.character
-    if spec.rating != "safe" and character_tag and _child_coded_character(character_tag):
+    if _explicit_blocked(character_tag):
         return Outcome(_display_query(spec, character_tag), None, [], time.monotonic() - started)
     if not character_tag and spec.kind != "cosplay":
         choices = [pair for pair in RESOLVED_CHARS
-                   if (spec.rating == "safe" or not _child_coded_character(pair[1]))
+                   if (not _explicit_blocked(pair[1]))
                    and pair[0] != previous_character]
         character_tag = random.choice(choices)[1] if choices else ""
     display = CHAR_BY_TAG.get(character_tag, character_tag) if character_tag else None
 
     if spec.kind == "cosplay":
-        posts = await _gather_cosplay(session, spec)
+        # Reddit search is also bounded, including its OAuth and listing requests.
+        try:
+            posts = await asyncio.wait_for(
+                _gather_cosplay(session, spec),
+                timeout=min(COSPLAY_SEARCH_BUDGET, max(0.01, deadline - time.monotonic())),
+            )
+        except asyncio.TimeoutError:
+            posts = []
     else:
-        posts = await _gather(session, _query_for(spec, character_tag), spec.mode, sources, spec.count, spec.rating) \
+        posts = await _gather(session, _query_for(spec, character_tag), spec.mode,
+                              sources, spec.count, spec.rating,
+                              budget=min(PRIMARY_SEARCH_BUDGET, max(0.0, deadline - time.monotonic()))) \
             if sources else []
 
     if not posts and character_tag and spec.kind != "cosplay":
-        log.info("no results for %r, retrying without the character tag",
-                 _display_query(spec, character_tag))
-        display = None
-        posts = await _gather(session, _query_for(spec, ""), spec.mode, sources, spec.count, spec.rating) \
-            if sources else []
+        fallback_choices = [pair for pair in RESOLVED_CHARS
+                            if pair[1] != character_tag
+                            and not _explicit_blocked(pair[1])
+                            and pair[0] != previous_character]
+        if fallback_choices:
+            fallback_display, fallback_tag = random.choice(fallback_choices)
+            log.info("no results for %r, retrying with character %r",
+                     _display_query(spec, character_tag), fallback_tag)
+            posts = await _gather(session, _query_for(spec, fallback_tag), spec.mode,
+                                  sources, spec.count, spec.rating,
+                                  budget=min(FALLBACK_SEARCH_BUDGET, max(0.0, deadline - time.monotonic()))) \
+                if sources else []
+            if posts:
+                character_tag = fallback_tag
+                display = fallback_display
 
     query = _display_query(spec, "" if display is None else character_tag)
-
     if not posts:
         return Outcome(query, display, [], time.monotonic() - started)
 
     sem = asyncio.Semaphore(CONCURRENCY)
-    raw = await asyncio.gather(*(_download(session, p, spec.limit, sem) for p in posts))
+    tasks = [asyncio.create_task(_download(session, p, spec.limit, sem)) for p in posts]
+    pending = set(tasks)
+    raw: list[tuple] = []
+    try:
+        # Stop waiting as soon as enough successful attachments are downloaded.
+        while pending and sum(r[1] is not None for r in raw) < spec.count:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            done, pending = await asyncio.wait(
+                pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+            )
+            if not done:
+                break
+            for task in done:
+                try:
+                    raw.append(task.result())
+                except Exception as exc:
+                    log.debug("Media download failed: %s", type(exc).__name__)
+    finally:
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
-    ok = [r for r in raw if r[1] is not None][: spec.count]
+    ok = [r for r in raw if r[1] is not None][:spec.count]
     ok_ids = {(r[0]["site"], r[0]["id"]) for r in ok}
     bad = [r for r in raw if r[1] is None and (r[0]["site"], r[0]["id"]) not in ok_ids][:6]
-
     return Outcome(query, display, ok + bad, time.monotonic() - started)
+
 
 def _render(spec: Spec, outcome: Outcome) -> tuple[list[discord.Embed], list[discord.File]]:
     files: list[discord.File] = []
@@ -1048,6 +1223,7 @@ def _render(spec: Spec, outcome: Outcome) -> tuple[list[discord.Embed], list[dis
 
     return embeds, files
 
+
 # -------------------------------------------------------------- result view
 
 class ResultView(discord.ui.View):
@@ -1119,9 +1295,9 @@ class ResultView(discord.ui.View):
                 "Adult-rated results can only be refreshed in age-restricted channels.", ephemeral=True,
             )
             return None
-        if spec.rating != "safe" and spec.character and _child_coded_character(spec.character):
+        if _explicit_blocked(spec.character):
             await interaction.response.send_message(
-                "Adult-rated searches aren't available for that character.", ephemeral=True,
+                "Searches for that excluded character are unavailable.", ephemeral=True,
             )
             return None
 
@@ -1850,9 +2026,9 @@ async def _genshin(
         "explicit",
     )
 
-    if spec.rating != "safe" and spec.character and _child_coded_character(spec.character):
+    if spec.character and _child_coded_character(spec.character):
         await interaction.edit_original_response(
-            content="Adult-rated searches aren't available for that character. Choose rating:safe."
+            content="Searches for that excluded character are unavailable."
         )
         return
     if spec.rating != "safe" and not _channel_is_nsfw(interaction):
@@ -1964,9 +2140,9 @@ async def _cosplay(
         spoiler=spoiler,
         limit=_file_limit(interaction),
     )
-    if spec.rating != "safe" and spec.character and _child_coded_character(spec.character):
+    if spec.character and _child_coded_character(spec.character):
         await interaction.edit_original_response(
-            content="Adult-rated searches aren't available for that character. Choose rating:safe."
+            content="Searches for that excluded character are unavailable."
         )
         return
     if spec.rating != "safe" and not _channel_is_nsfw(interaction):
