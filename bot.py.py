@@ -282,8 +282,9 @@ def _adult_character(tag: str) -> bool:
     return _base_character_tag(tag) in ADULT_TAGS
 
 
-# Exclude posts containing known male characters or male-presence tags.
-# These are separate filtering rules: existing character and safety lists stay intact.
+# Female-focused explicit results may include a male partner, but not male-focused
+# or multi-male scenes. Keep the existing character/safety lists intact and make
+# the gender-presence rule more precise than the earlier female-only filter.
 MALE_CHARACTER_TAGS = frozenset({
     "aether", "albedo", "alhaitham", "arataki_itto", "baizhu", "bennett",
     "chongyun", "cyno", "dainsleif", "diluc", "dottore", "il_dottore",
@@ -294,20 +295,48 @@ MALE_CHARACTER_TAGS = frozenset({
     "varka", "venti", "wanderer", "wriothesley", "xiao", "xingqiu",
     "zhongli", "lohen", "valeriy", "teppei", "enjou", "ruu",
 })
-MALE_PRESENCE_TAGS = frozenset({
-    "1boy", "2boys", "3boys", "4boys", "5boys", "6+boys", "multiple_boys",
-    "1man", "2men", "multiple_males", "male", "male_only", "male_focus",
-    "male_character", "male_protagonist", "male_pov", "male_hands",
-    "faceless_male", "boy", "boys", "man", "men", "otoko",
+# Tags that indicate male presence but can still be female-focused.
+MALE_PARTNER_TAGS = frozenset({
+    "1boy", "1man", "male", "male_character", "male_pov", "male_hands",
+    "faceless_male", "man", "otoko",
+})
+# Tags that make the male side the focus or imply several male participants.
+MALE_FOCUS_TAGS = frozenset({
+    "2boys", "3boys", "4boys", "5boys", "6+boys", "multiple_boys",
+    "2men", "multiple_males", "male_only", "male_focus",
+    "male_protagonist", "boys", "men", "guys",
+})
+FEMALE_PRESENCE_TAGS = frozenset({
+    "1girl", "2girls", "3girls", "4girls", "5girls", "6+girls",
+    "multiple_girls", "girl", "girls", "female", "female_focus",
+    "all_female",
 })
 
 
-def _male_tagged_post(post: dict) -> bool:
-    tags = (* (post.get("tags") or []), * (post.get("character_tags") or []))
-    names = {_base_character_tag(str(tag)) for tag in tags}
-    return bool(names & (MALE_CHARACTER_TAGS | MALE_PRESENCE_TAGS)) or any(
+def _post_gender_markers(post: dict) -> set[str]:
+    tags = (*(post.get("tags") or []), *(post.get("character_tags") or []))
+    return {_base_character_tag(str(tag)) for tag in tags}
+
+
+def _male_focused_post(post: dict) -> bool:
+    names = _post_gender_markers(post)
+    # Keep named male Genshin characters blocked here; generic male-partner tags
+    # are allowed, but named male pairings would need a separate adult review.
+    if names & (MALE_FOCUS_TAGS | MALE_CHARACTER_TAGS):
+        return True
+    return any(re.fullmatch(r"[2-9][0-9]*(?:boys?|men)", name) for name in names)
+
+
+def _male_present(post: dict) -> bool:
+    names = _post_gender_markers(post)
+    return bool(names & (MALE_PARTNER_TAGS | MALE_FOCUS_TAGS)) or any(
         re.fullmatch(r"[1-9][0-9]*(?:boys?|men)", name) for name in names
     )
+
+
+def _female_present(post: dict) -> bool:
+    names = _post_gender_markers(post)
+    return bool(names & KNOWN_FEMALE_TAGS) or bool(names & FEMALE_PRESENCE_TAGS)
 
 
 def _reddit_male_mentioned(title: str, flair: str) -> bool:
@@ -335,8 +364,14 @@ def _allowed_adult_post(post: dict) -> bool:
     if not tags:
         return False
     character_tags = post.get("character_tags") or []
-    return (not any(_child_coded_character(tag) for tag in (*tags, *character_tags))
-            and not _male_tagged_post(post))
+    if any(_child_coded_character(tag) for tag in (*tags, *character_tags)):
+        return False
+    if _male_focused_post(post):
+        return False
+    # Allow a male partner, but only when there is also a female subject.
+    if _male_present(post) and not _female_present(post):
+        return False
+    return True
 
 
 POPULAR_TAGS = [
@@ -1921,6 +1956,33 @@ async def _char_autocomplete(interaction: discord.Interaction, current: str):
     return out
 
 
+# /genshin offers all validated characters across three separate 25-choice
+# autocomplete fields. /cosplay keeps its existing searchable character field.
+async def _char_group_autocomplete(current: str, group: int):
+    chars = sorted(RESOLVED_CHARS, key=lambda pair: pair[0].lower())
+    needle = _norm(current)
+    # When typing in the original field, keep full-roster search available.
+    # Empty input shows this field's designated group instead.
+    options = chars if (needle and group == 0) else chars[group * 25:(group + 1) * 25]
+    return [
+        app_commands.Choice(name=display, value=tag)
+        for display, tag in options
+        if not needle or needle in _norm(display) or needle in _norm(tag)
+    ][:25]
+
+
+async def _genshin_char_1(interaction: discord.Interaction, current: str):
+    return await _char_group_autocomplete(current, 0)
+
+
+async def _genshin_char_2(interaction: discord.Interaction, current: str):
+    return await _char_group_autocomplete(current, 1)
+
+
+async def _genshin_char_3(interaction: discord.Interaction, current: str):
+    return await _char_group_autocomplete(current, 2)
+
+
 async def _tag_autocomplete(interaction: discord.Interaction, current: str):
     trailing_space = current.endswith(" ")
     parts = current.split()
@@ -1994,13 +2056,18 @@ RATING_CHOICES = [
     preset="Quick tag bundle — leave blank for vanilla",
     type="image / video / any",
     rating="Rating filter",
-    character="Leave blank for a random girl",
+    character="Character group 1 (first 25) — or type any name",
+    character_2="Character group 2 (next 25); choose only one group",
+    character_3="Character group 3 (remaining names); choose only one group",
     tags="Extra booru tags",
     spoiler="Hide behind a spoiler",
 )
 
 @app_commands.choices(type=TYPE_CHOICES, rating=RATING_CHOICES)
-@app_commands.autocomplete(character=_char_autocomplete, tags=_tag_autocomplete, preset=_preset_autocomplete)
+@app_commands.autocomplete(
+    character=_genshin_char_1, character_2=_genshin_char_2, character_3=_genshin_char_3,
+    tags=_tag_autocomplete, preset=_preset_autocomplete,
+)
 async def _genshin(
     interaction: discord.Interaction,
     count: app_commands.Range[int, 1, 10] = 3,
@@ -2008,17 +2075,26 @@ async def _genshin(
     type: str | None = None,
     rating: str | None = None,
     character: str = "",
+    character_2: str = "",
+    character_3: str = "",
     tags: str = "",
     spoiler: bool = False,
 ) -> None:
     await interaction.response.defer(thinking=True)
+
+    selected_characters = [c for c in (character, character_2, character_3) if c]
+    if len(selected_characters) > 1:
+        await interaction.edit_original_response(
+            content="Choose a character from only one of the three character fields."
+        )
+        return
 
     spec = _apply_preset(
         preset,
         count,
         type,
         rating,
-        character,
+        selected_characters[0] if selected_characters else "",
         tags,
         spoiler,
         interaction.user.id,
