@@ -251,6 +251,8 @@ CHARACTERS: list[tuple[str, str]] = [
 
 RESOLVED_CHARS: list[tuple[str, str]] = list(CHARACTERS)
 CHAR_BY_TAG: dict[str, str] = {tag: display for display, tag in CHARACTERS}
+# Derived from the existing roster; no character entries are added or removed.
+KNOWN_FEMALE_TAGS = frozenset(tag for _, tag in CHARACTERS)
 
 # Adult-rated searches must never deliberately include child-coded characters.
 # Applies to both explicitly selected characters and posts tagged with them.
@@ -1100,19 +1102,15 @@ async def run_search(session, spec: Spec, *, previous_character: str | None = No
     started = time.monotonic()
     deadline = started + TOTAL_FETCH_BUDGET
     sources = _pick_sources(spec)
-
     character_tag = spec.character
     if _explicit_blocked(character_tag):
         return Outcome(_display_query(spec, character_tag), None, [], time.monotonic() - started)
-    if not character_tag and spec.kind != "cosplay":
-        choices = [pair for pair in RESOLVED_CHARS
-                   if (not _explicit_blocked(pair[1]))
-                   and pair[0] != previous_character]
-        character_tag = random.choice(choices)[1] if choices else ""
+
     display = CHAR_BY_TAG.get(character_tag, character_tag) if character_tag else None
+    posts: list[dict] = []
 
     if spec.kind == "cosplay":
-        # Reddit search is also bounded, including its OAuth and listing requests.
+        # Keep the existing Reddit cosplay behavior unchanged.
         try:
             posts = await asyncio.wait_for(
                 _gather_cosplay(session, spec),
@@ -1120,28 +1118,136 @@ async def run_search(session, spec: Spec, *, previous_character: str | None = No
             )
         except asyncio.TimeoutError:
             posts = []
-    else:
-        posts = await _gather(session, _query_for(spec, character_tag), spec.mode,
-                              sources, spec.count, spec.rating,
-                              budget=min(PRIMARY_SEARCH_BUDGET, max(0.0, deadline - time.monotonic()))) \
-            if sources else []
 
-    if not posts and character_tag and spec.kind != "cosplay":
-        fallback_choices = [pair for pair in RESOLVED_CHARS
-                            if pair[1] != character_tag
-                            and not _explicit_blocked(pair[1])
-                            and pair[0] != previous_character]
-        if fallback_choices:
-            fallback_display, fallback_tag = random.choice(fallback_choices)
-            log.info("no results for %r, retrying with character %r",
-                     _display_query(spec, character_tag), fallback_tag)
-            posts = await _gather(session, _query_for(spec, fallback_tag), spec.mode,
-                                  sources, spec.count, spec.rating,
-                                  budget=min(FALLBACK_SEARCH_BUDGET, max(0.0, deadline - time.monotonic()))) \
-                if sources else []
-            if posts:
-                character_tag = fallback_tag
-                display = fallback_display
+    elif not spec.character:
+        # For random searches, a match only counts if its media actually downloads.
+        # Search other eligible characters automatically, without ever dropping the
+        # character tag or changing the requested category/rating/media type.
+        candidates = [pair for pair in RESOLVED_CHARS
+                      if not _explicit_blocked(pair[1])
+                      and pair[0] != previous_character]
+        random.shuffle(candidates)
+        seen_tags: set[str] = set()
+        candidates = [(name, tag) for name, tag in candidates
+                      if not (tag in seen_tags or seen_tags.add(tag))]
+        queued = iter(candidates)
+        active: dict[asyncio.Task, tuple[str, str]] = {}
+
+        def launch_next() -> bool:
+            # Reserve a little time to fetch a media attachment after finding a post.
+            remaining = deadline - time.monotonic() - 1.0
+            if not sources or remaining <= 0:
+                return False
+            next_pair = next(queued, None)
+            if next_pair is None:
+                return False
+            name, tag = next_pair
+            task = asyncio.create_task(_gather(
+                session, _query_for(spec, tag), spec.mode, sources,
+                spec.count, spec.rating,
+                budget=min(PRIMARY_SEARCH_BUDGET, remaining),
+            ))
+            active[task] = (name, tag)
+            return True
+
+        # Two concurrent character probes limit API pressure while letting an
+        # uncommon character fail without blocking other promising searches.
+        for _ in range(2):
+            launch_next()
+
+        try:
+            while active and time.monotonic() < deadline:
+                remaining = deadline - time.monotonic()
+                finished, _ = await asyncio.wait(
+                    active, timeout=max(0.0, remaining),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not finished:
+                    break
+                for task in finished:
+                    name, tag = active.pop(task)
+                    try:
+                        trial_posts = task.result()
+                    except Exception as exc:
+                        log.debug("Random character search failed for %s: %s", tag, type(exc).__name__)
+                        trial_posts = []
+                    if trial_posts:
+                        # Previous versions stopped here even if every attachment
+                        # was unavailable or oversized. Check real download success.
+                        sem = asyncio.Semaphore(CONCURRENCY)
+                        media_tasks = [asyncio.create_task(_download(session, post, spec.limit, sem))
+                                       for post in trial_posts]
+                        pending_media = set(media_tasks)
+                        raw: list[tuple] = []
+                        try:
+                            while pending_media and sum(item[1] is not None for item in raw) < spec.count:
+                                left = deadline - time.monotonic()
+                                if left <= 0:
+                                    break
+                                done_media, pending_media = await asyncio.wait(
+                                    pending_media, timeout=left,
+                                    return_when=asyncio.FIRST_COMPLETED,
+                                )
+                                if not done_media:
+                                    break
+                                for media_task in done_media:
+                                    try:
+                                        raw.append(media_task.result())
+                                    except Exception as exc:
+                                        log.debug("Media download failed: %s", type(exc).__name__)
+                        finally:
+                            for media_task in pending_media:
+                                media_task.cancel()
+                            if pending_media:
+                                await asyncio.gather(*pending_media, return_exceptions=True)
+
+                        good = [item for item in raw if item[1] is not None][:spec.count]
+                        if good:
+                            ok_ids = {(item[0]["site"], item[0]["id"]) for item in good}
+                            bad = [item for item in raw if item[1] is None
+                                   and (item[0]["site"], item[0]["id"]) not in ok_ids][:6]
+                            return Outcome(_display_query(spec, tag), name,
+                                           good + bad, time.monotonic() - started)
+                    # A character with no matching post OR no downloadable result
+                    # is skipped. Continue with a new eligible character immediately.
+                    launch_next()
+        finally:
+            for task in active:
+                task.cancel()
+            if active:
+                await asyncio.gather(*active, return_exceptions=True)
+
+        return Outcome(_display_query(spec, ""), None, [], time.monotonic() - started)
+
+    else:
+        # Explicitly selected character: preserve the existing search/fallback.
+        posts = await _gather(
+            session, _query_for(spec, character_tag), spec.mode,
+            sources, spec.count, spec.rating,
+            budget=min(PRIMARY_SEARCH_BUDGET, max(0.0, deadline - time.monotonic())),
+        ) if sources else []
+
+        if not posts and character_tag:
+            fallback_choices = [pair for pair in RESOLVED_CHARS
+                                if pair[1] != character_tag
+                                and not _explicit_blocked(pair[1])
+                                and pair[0] != previous_character]
+            random.shuffle(fallback_choices)
+            for fallback_display, fallback_tag in fallback_choices:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                log.info("no results for %r, retrying with character %r",
+                         _display_query(spec, character_tag), fallback_tag)
+                posts = await _gather(
+                    session, _query_for(spec, fallback_tag), spec.mode,
+                    sources, spec.count, spec.rating,
+                    budget=min(FALLBACK_SEARCH_BUDGET, max(0.0, remaining)),
+                ) if sources else []
+                if posts:
+                    character_tag = fallback_tag
+                    display = fallback_display
+                    break
 
     query = _display_query(spec, "" if display is None else character_tag)
     if not posts:
@@ -1177,7 +1283,6 @@ async def run_search(session, spec: Spec, *, previous_character: str | None = No
     ok_ids = {(r[0]["site"], r[0]["id"]) for r in ok}
     bad = [r for r in raw if r[1] is None and (r[0]["site"], r[0]["id"]) not in ok_ids][:6]
     return Outcome(query, display, ok + bad, time.monotonic() - started)
-
 
 def _render(spec: Spec, outcome: Outcome) -> tuple[list[discord.Embed], list[discord.File]]:
     files: list[discord.File] = []
