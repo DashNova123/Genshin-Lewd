@@ -38,6 +38,9 @@ TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 GUILD_ID = os.getenv("GUILD_ID", "").strip()
 GELBOORU_API_KEY = os.getenv("GELBOORU_API_KEY", "").strip()
 GELBOORU_USER_ID = os.getenv("GELBOORU_USER_ID", "").strip()
+# Rule34 credentials are stored on the server, never in source code.
+RULE34_API_KEY = os.getenv("RULE34_API_KEY", "").strip()
+RULE34_USER_ID = os.getenv("RULE34_USER_ID", "").strip()
 # Required for /cosplay — it is the only cosplay source.
 REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID", "").strip()
 REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET", "").strip()
@@ -272,6 +275,47 @@ ADULT_TAGS = frozenset({
 })
 
 
+# Strict allowlist for the separate /rule34 command. Characters omitted from
+# this list are never randomly selected, and cannot be chosen by typing them.
+# Conservative by design: uncertain-age characters are excluded.
+RULE34_ADULT_CHARACTER_TAGS = frozenset({
+    "arlecchino", "beidou", "candace", "chiori", "citlali", "clorinde",
+    "dehya", "eula", "ganyu", "jean", "la_signora", "lisa",
+    "mavuika", "mona", "navia", "ningguang", "raiden_shogun",
+    "rosaria", "sangonomiya_kokomi", "shenhe", "skirk",
+    "xianyun", "xilonen", "yae_miko", "yelan",
+})
+RULE34_BLOCKED_TAGS = frozenset({
+    "loli", "shota", "child", "children", "underage", "minor", "minors",
+    "toddler", "infant", "baby", "preteen", "teenager", "young_girl",
+    "young_boy", "little_girl", "little_boy", "elementary_school_student",
+    "middle_school_student", "kindergartener",
+})
+
+
+def _rule34_adult_character(tag: str) -> bool:
+    return _base_character_tag(tag) in RULE34_ADULT_CHARACTER_TAGS
+
+
+def _allowed_rule34_post(post: dict) -> bool:
+    """Metadata filter for /rule34. It is not a visual age-verification tool."""
+    raw_tags = post.get("tags") or []
+    if not raw_tags:
+        return False
+    tags = {_base_character_tag(str(t)) for t in raw_tags}
+    if "genshin_impact" not in tags:
+        return False
+    if tags & RULE34_BLOCKED_TAGS:
+        return False
+    if tags & CHILD_CODED_TAGS:
+        return False
+    # Refuse mixed-character posts involving any non-allowlisted female Genshin
+    # character, rather than accepting a whitelisted adult in the same post.
+    if (tags & KNOWN_FEMALE_TAGS) - RULE34_ADULT_CHARACTER_TAGS:
+        return False
+    return bool(tags & RULE34_ADULT_CHARACTER_TAGS)
+
+
 def _base_character_tag(tag: str) -> str:
     return tag.split("_(genshin_impact)", 1)[0].lower().strip()
 
@@ -498,6 +542,7 @@ def _p_rule34(data) -> list[dict]:
         )
         tags = p.get("tags") or ""
         item["tags"] = tags.split() if isinstance(tags, str) else tags if isinstance(tags, list) else []
+        item["rating"] = str(p.get("rating") or "").lower().strip()
         out.append(item)
     return out
 
@@ -552,11 +597,12 @@ SOURCES: list[Source] = [
         url="https://api.rule34.xxx/index.php",
         host="api.rule34.xxx",
         max_page=600,
-        min_interval=0.5,
-        cosplay=True,
+        min_interval=1.1,  # Stay below the site's API rate limit.
+        cosplay=False,
         params=lambda t, pg: {
             "page": "dapi", "s": "post", "q": "index", "json": 1,
             "tags": t, "limit": 100, "pid": pg - 1,
+            "api_key": RULE34_API_KEY, "user_id": RULE34_USER_ID,
         },
         parse=_p_rule34,
     ),
@@ -846,8 +892,14 @@ async def _try_source(session, src: Source, tags: str, mode: str,
             # Expand only after a full page proves the current window too small.
             PAGE_BOUNDS[key] = min(src.max_page, PAGE_BOUNDS[key] * 2)
 
+        expected_rating = {"explicit": "e", "questionable": "q", "safe": "s"}.get(rating)
         good = [p for p in posts if _matches(p, mode)
-                and _allowed_adult_post(p)]
+                and _allowed_adult_post(p)
+                and (src.name != "Rule34" or (
+                    _allowed_rule34_post(p)
+                    and (expected_rating is None or p.get("rating") in
+                         (expected_rating, rating))
+                ))]
         if good:
             random.shuffle(good)
             return good[:want]
@@ -1016,7 +1068,7 @@ class Outcome:
 
 MODE_CODE = {"any": "a", "image": "i", "video": "v"}
 RATING_CODE = {"explicit": "e", "questionable": "q", "safe": "s", "any": "a"}
-KIND_CODE = {"art": "a", "cosplay": "c"}
+KIND_CODE = {"art": "a", "cosplay": "c", "rule34": "r"}
 
 
 def _encode_spec(spec: Spec) -> str:
@@ -1088,6 +1140,13 @@ def _pick_sources(spec: Spec) -> list[Source]:
     for src in SOURCES:
         if src.auth and not (GELBOORU_API_KEY and GELBOORU_USER_ID):
             continue
+        if src.name == "Rule34":
+            # Do not mix sources: /rule34 is Rule34-only. Other slash commands
+            # keep their previous sources, and /cosplay remains Reddit-only.
+            if spec.kind != "rule34" or not (RULE34_API_KEY and RULE34_USER_ID):
+                continue
+        elif spec.kind == "rule34":
+            continue
         if spec.kind == "cosplay" and src.name != "Danbooru":
             continue
         if spec.kind == "cosplay" and not src.cosplay:
@@ -1103,7 +1162,9 @@ async def run_search(session, spec: Spec, *, previous_character: str | None = No
     deadline = started + TOTAL_FETCH_BUDGET
     sources = _pick_sources(spec)
     character_tag = spec.character
-    if _explicit_blocked(character_tag):
+    if _explicit_blocked(character_tag) or (
+        spec.kind == "rule34" and character_tag and not _rule34_adult_character(character_tag)
+    ):
         return Outcome(_display_query(spec, character_tag), None, [], time.monotonic() - started)
 
     display = CHAR_BY_TAG.get(character_tag, character_tag) if character_tag else None
@@ -1125,6 +1186,7 @@ async def run_search(session, spec: Spec, *, previous_character: str | None = No
         # character tag or changing the requested category/rating/media type.
         candidates = [pair for pair in RESOLVED_CHARS
                       if not _explicit_blocked(pair[1])
+                      and (spec.kind != "rule34" or _rule34_adult_character(pair[1]))
                       and pair[0] != previous_character]
         random.shuffle(candidates)
         seen_tags: set[str] = set()
@@ -1231,6 +1293,7 @@ async def run_search(session, spec: Spec, *, previous_character: str | None = No
             fallback_choices = [pair for pair in RESOLVED_CHARS
                                 if pair[1] != character_tag
                                 and not _explicit_blocked(pair[1])
+                                and (spec.kind != "rule34" or _rule34_adult_character(pair[1]))
                                 and pair[0] != previous_character]
             random.shuffle(fallback_choices)
             for fallback_display, fallback_tag in fallback_choices:
@@ -1314,6 +1377,7 @@ def _render(spec: Spec, outcome: Outcome) -> tuple[list[discord.Embed], list[dis
     title = (
         "Genshin cosplay (IRL)"
         if spec.kind == "cosplay"
+        else "Genshin Impact (Rule34)" if spec.kind == "rule34"
         else "Genshin Impact"
     )
 
@@ -2088,6 +2152,16 @@ async def _genshin_char_3(interaction: discord.Interaction, current: str):
     return await _char_group_autocomplete(current, 2)
 
 
+async def _rule34_char_autocomplete(interaction: discord.Interaction, current: str):
+    needle = _norm(current)
+    return [
+        app_commands.Choice(name=display, value=tag)
+        for display, tag in RESOLVED_CHARS
+        if _rule34_adult_character(tag)
+        and (not needle or needle in _norm(display) or needle in _norm(tag))
+    ][:25]
+
+
 async def _tag_autocomplete(interaction: discord.Interaction, current: str):
     trailing_space = current.endswith(" ")
     parts = current.split()
@@ -2242,6 +2316,84 @@ tree.add_command(app_commands.Command(
 ))
 tree.add_command(app_commands.Command(
     name="g", description="Alias for /genshin", callback=_genshin
+))
+
+
+@app_commands.describe(
+    count="How many posts (1-10)",
+    type="image, video, or any",
+    rating="Rating filter; explicit by default",
+    character="Optional adult Genshin character; blank chooses randomly",
+    tags="Optional Rule34 tags",
+    spoiler="Hide media behind Discord spoiler attachments",
+)
+@app_commands.choices(type=TYPE_CHOICES, rating=RATING_CHOICES)
+@app_commands.autocomplete(character=_rule34_char_autocomplete, tags=_tag_autocomplete)
+async def _rule34(
+    interaction: discord.Interaction,
+    count: app_commands.Range[int, 1, 10] = 3,
+    type: str | None = None,
+    rating: str | None = None,
+    character: str = "",
+    tags: str = "",
+    spoiler: bool = False,
+) -> None:
+    # All /rule34 searches (even rating:safe) belong in an age-restricted channel.
+    if not _channel_is_nsfw(interaction):
+        await interaction.response.send_message(
+            "Use /rule34 in an age-restricted (NSFW) channel.", ephemeral=True,
+        )
+        return
+    if not (RULE34_API_KEY and RULE34_USER_ID):
+        await interaction.response.send_message(
+            "Rule34 isn't configured. Set RULE34_API_KEY and RULE34_USER_ID "
+            "in your FadeHost environment first.", ephemeral=True,
+        )
+        return
+    if character and not _rule34_adult_character(character):
+        await interaction.response.send_message(
+            "That character isn't on the approved adult-character list for /rule34.",
+            ephemeral=True,
+        )
+        return
+    # Reject search terms that deliberately target underage material.
+    if any(_base_character_tag(t.lstrip("-")) in
+           (RULE34_BLOCKED_TAGS | CHILD_CODED_TAGS)
+           for t in re.split(r"[\s,]+", tags.strip()) if t):
+        await interaction.response.send_message(
+            "Those tags aren't supported by /rule34.", ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(thinking=True)
+    spec = Spec(
+        user_id=interaction.user.id,
+        count=count,
+        mode=type or "any",
+        rating=rating or "explicit",
+        kind="rule34",
+        character=character,
+        extra_tags=tags,
+        spoiler=spoiler,
+        limit=_file_limit(interaction),
+    )
+    outcome = await run_search(interaction.client.session, spec)
+    if not outcome.results or not any(blob is not None for _, blob, _, _ in outcome.results):
+        await interaction.edit_original_response(
+            content="No matching downloadable Rule34 results. Try a different adult "
+                    "character, fewer tags, or another media type."
+        )
+        return
+    embeds, files = _render(spec, outcome)
+    message = await interaction.edit_original_response(
+        embeds=embeds, attachments=files, view=VIEW,
+    )
+    _remember(message.id, outcome)
+
+
+tree.add_command(app_commands.Command(
+    name="rule34", description="Genshin art from Rule34 only (18+ channel)",
+    callback=_rule34, nsfw=True,
 ))
 
 
